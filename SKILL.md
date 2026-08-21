@@ -1,0 +1,75 @@
+---
+name: meeting-recording-processor
+description: Locally extract Cantonese-heavy meeting audio or video to a canonical transcript JSON on Apple Silicon, then export TXT/SRT only when explicitly requested. Never auto-generate meeting notes.
+---
+
+# Meeting Recording Processor
+
+## Contract
+
+使用呢個 project 處理本機廣東話／中英夾雜 meeting recording。流程有兩個獨立步驟；唔可以自動由第一步跳到第二步，更唔可以自動生成 meeting notes。
+
+## Preconditions
+
+1. 只接受 `.m4a`、`.mp3`、`.wav`、`.mp4`、`.mov` regular file。
+2. 必須係 macOS Apple Silicon arm64，並已安裝 `uv`、`ffmpeg`、`ffprobe`。
+3. 先執行 `uv run mrp doctor`。缺少 model 時，向使用者說明並明確執行 `uv run mrp download-model --asr all`；下載係唯一可連網步驟。
+4. 唔可以 upload media、transcript 或 context，亦唔可以改用 cloud ASR。
+
+## Step 1 — Extract
+
+執行：
+
+```bash
+uv run mrp extract <input> --asr auto
+```
+
+必要時可以加入 `--context-file`、`--output-dir`、`--work-dir` 或 `--cache-dir`。預設 `auto` 先 Qwen3，只喺客觀 hard failure fallback SenseVoice：backend exception、空白、Unicode 標點／符號比例超過 90%，或至少 10 秒 active audio 但少過 3 個 substantive 字元。
+
+一般專有名詞、accuracy、punctuation 或 segmentation 問題唔可以觸發自動 fallback。使用者如要求人工重試，另行執行 `--asr sensevoice` 並使用另一 output directory，避免覆蓋第一次 JSON。
+
+Extract 成功只會產生：
+
+```text
+<output-dir>/<input-stem>.transcript.json
+```
+
+檢查 `status`、`selected_attempt_id`、`attempts`、`warnings` 同 `transcript`。Raw attempt 必須保留；唔融合、刪除或以 postprocessed text 覆蓋。
+
+完成後必須停止並回報：
+
+```text
+本機轉錄已完成並寫出 transcript JSON。
+流程已停喺 extract；未有 export、整理逐字稿或生成會議記錄。
+```
+
+## Step 2 — Export（只在明確要求時）
+
+執行：
+
+```bash
+uv run mrp export <input-stem>.transcript.json
+```
+
+只輸出同名 `.txt` 同 `.srt`。`status: failed` 嘅 JSON 唔可以 export。SenseVoice/estimated timing warnings 要原樣告知使用者，唔聲稱係 word-level timestamp。
+
+完成後停止；唔生成 summary、notes、clean transcript 或 action items。
+
+## Failure handling
+
+- 指定 `--asr qwen3` 或 `--asr sensevoice` 時，唔可以靜默換 backend。
+- 所有 attempt 失敗時，保留 `status: failed` diagnostic JSON，報告非零狀態並停止。
+- output 已存在時，預設拒絕覆蓋。只喺使用者明確授權取代該精確檔案先用 `--overwrite`。
+- 唔刪 input。Work cleanup 只可由程式清理本次 run 建立嘅 scoped directory。
+
+## Text policy
+
+- Canonical output 使用香港繁體，但保留 attempt raw text。
+- 保留廣東話口語、語氣、中英夾雜同原意；唔翻譯或改寫成普通話書面語。
+- Context/profile 只作 ASR hint；唔可以加入錄音冇講過嘅內容。
+
+## Out of scope
+
+Speaker diarization、video OCR/frame analysis、Whisper、cloud ASR、live captions、自動 transcript cleanup、meeting notes、summary、action-item extraction。
+
+詳細 contract：`SPEC.md`。Implementation/data flow：`ARCHITECTURE.md`。Machine-readable schema：`schemas/transcript-v1.schema.json`。

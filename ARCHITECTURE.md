@@ -1,0 +1,175 @@
+# Meeting Recording Processor — Architecture
+
+**版本：** 0.1.0  
+**狀態：** Phase 1 implementation architecture
+
+## 1. System boundary
+
+Project 只有兩個本機、互不自動串連嘅 application flows：
+
+```mermaid
+flowchart TD
+    A["Audio / video"] --> B["extract"]
+    B --> C["Canonical transcript JSON"]
+    C --> D["Stop / human review"]
+    D --> E["export (explicit)"]
+    E --> F["TXT + SRT"]
+```
+
+外部 AI cleanup、meeting notes 或 action items 唔係本 system component。影片 frame、cloud API 同 speaker identity 都不會進入 data flow。
+
+## 2. Extract data flow
+
+```mermaid
+flowchart TD
+    A["Validate + ffprobe"] --> B["16 kHz mono WAV"]
+    B --> C{"ASR mode"}
+    C -->|"qwen3 / auto"| D["Qwen3 adapter"]
+    C -->|"sensevoice"| E["SenseVoice adapter"]
+    D --> F{"Hard failure?"}
+    F -->|"auto + yes"| E
+    F -->|"no"| G["Post-process + JSON"]
+    E --> G
+```
+
+Routing state：
+
+```mermaid
+stateDiagram-v2
+    [*] --> Qwen3: auto
+    Qwen3 --> Selected: usable
+    Qwen3 --> SenseVoice: objective hard failure
+    SenseVoice --> Selected: usable
+    SenseVoice --> Failed: hard failure
+    Selected --> Persisted
+    Failed --> DiagnosticJSON
+    Persisted --> [*]
+    DiagnosticJSON --> [*]
+```
+
+指定 `qwen3` 或 `sensevoice` 時只有一個 attempt。`auto` 都只會有最多兩個；pipeline 唔做 ensemble 或 subjective quality ranking。
+
+## 3. Module map
+
+| Module | Responsibility | Boundary |
+|---|---|---|
+| `cli.py` | argparse、user messages、exit codes | 不載入 model |
+| `config.py` | modes、paths、defaults、supported extensions | 不做 I/O pipeline |
+| `runtime.py` | Darwin/arm64、commands、HF offline env | 不做 inference |
+| `media/probe.py` | ffprobe JSON、audio stream selection | 不 decode transcript |
+| `media/normalize.py` | ffmpeg stream map、PCM WAV | 不改 input |
+| `media/signal.py` | duration/RMS/active-audio stats | 不評主觀準確度 |
+| `models.py` | explicit download、offline snapshot resolve | extract 不連網 |
+| `asr/qwen3.py` | Qwen result → `BackendResult` | 不決定 fallback |
+| `asr/sensevoice.py` | WAV chunks → `BackendResult` | 不偽造 word timestamp |
+| `quality.py` | objective hard-failure metrics | 不做內容評分 |
+| `postprocess.py` | NFC、whitespace、s2hk、cue grouping | 不翻譯／摘要／改寫 |
+| `pipeline.py` | lifecycle、routing、attempt preservation | 不輸出 TXT/SRT |
+| `schema_io.py` | validation、atomic JSON/text writes | 不做 ASR |
+| `outputs/writers.py` | completed JSON → TXT/SRT | 拒絕 failed JSON |
+| `diagnostics.py` | platform/package/model availability report | 不修復或下載 |
+
+## 4. Backend contract
+
+Adapters 實作：
+
+```python
+class AsrBackend(Protocol):
+    name: str
+    model_id: str
+
+    def transcribe(
+        self,
+        audio_path: Path,
+        *,
+        language: str,
+        profile_text: str | None,
+    ) -> BackendResult: ...
+```
+
+`BackendResult` 包含 backend/model/language、raw text、零至多個 segments、metadata 同 warnings。Pipeline 只識 canonical dataclass，唔依賴 upstream library result type。
+
+### Qwen3
+
+- lazy import `mlx_qwen3_asr.transcribe`；
+- 使用 local snapshot path、`return_timestamps=True`、`return_chunks=True`；
+- 優先讀 model segments，冇先讀 chunks；
+- 保存 finish reason、truncation 同 timestamp provenance。
+
+### SenseVoice
+
+- lazy import `mlx_audio.stt.load`，直接載入 local snapshot path；
+- normalized WAV 以 30 秒分段，逐段 `generate(..., language="yue", use_itn=False)`；
+- 保存 chunk start/end、language/emotion/event（如 runtime 有提供）；
+- 原生冇 word timestamp，postprocessor 對每個 chunk 做 weighted cue estimation。
+
+## 5. Quality gate
+
+Quality gate 只使用可重現 signals：
+
+| Signal | Rule | `auto` action |
+|---|---|---|
+| backend error | exception | fallback |
+| empty output | non-whitespace = 0 | fallback |
+| punctuation collapse | Unicode P/S ratio > 0.90 | fallback |
+| near-zero speech text | active audio >= 10s 且 L/N < 3 | fallback |
+| term/accuracy concern | 無可靠 objective rule | accept；人手可另行 retry |
+
+每個 signal 嘅 measured values 同 reasons 都嵌入 attempt。第一次失敗 attempt 係 immutable evidence；selected attempt 只靠 `selected_attempt_id` 指向。
+
+## 6. Canonical package and timing provenance
+
+JSON 係 extract 唯一 output、亦係 export 唯一 input。主要區域：
+
+| Field | Content |
+|---|---|
+| `source` | absolute path、name、size、SHA-256、media/signal metadata |
+| `request` | mode、language、context/hash、models、`offline: true` |
+| `attempts` | raw text/segments、quality、errors、runtime、snapshot |
+| `selected_attempt_id` | 成功 attempt pointer；failed 時為 null |
+| `transcript` | Traditional canonical text/segments；failed 時為 null |
+| `processing` | deterministic transforms、optional retained work path |
+| `tool` | Python/package/platform/ffprobe provenance |
+
+Segment `timing_source`：
+
+- `model`：原生 model timestamp；
+- `estimated_from_chunk`：有 chunk boundaries，cue 位置按字元權重估算；
+- `estimated_from_duration`：只有總 duration，整份文字按字元權重估算。
+
+## 7. Filesystem and safety
+
+```text
+input (read-only)
+  ├─ work/<stem>-<run-id>/audio-16k-mono.wav   # default cleanup
+  └─ output/<stem>.transcript.json             # atomic write
+        ├─ output/<stem>.txt                    # explicit export
+        └─ output/<stem>.srt                    # explicit export
+```
+
+- work directory 使用 run-specific name，cleanup 只針對該 directory；
+- `--keep-work-files` 先保存 WAV；
+- default collision policy 係 fail；
+- temp file同 final output 位於同一 parent，以 `os.replace` 原子提交；
+- JSON 保存 raw attempt，所以 canonical s2hk conversion 不會破壞原始證據。
+
+## 8. Offline model lifecycle
+
+`download-model` 係唯一 network-aware path：Hugging Face cache environment 設為 online 並下載 snapshot。`extract` 每次都重新設成 offline，加 `local_files_only=True` resolve；cache miss 轉成 domain error，絕不傳 media 到 remote service。
+
+## 9. Verification strategy
+
+Backend-independent suite 注入 fake platform/probe/normalizer/signal/model/backend，驗證：
+
+- no-fallback success、punctuation fallback、backend exception fallback；
+- subjective-but-substantive output 不 fallback；
+- explicit Qwen mode 不 fallback；
+- failed diagnostic JSON、attempt preservation、collision policy；
+- media command construction、signal analysis、text conversion/cue timing；
+- completed/failed schema、TXT/SRT output、CLI defaults。
+
+支援平台上另需 integration smoke tests：兩個 model load、五種 input containers、影片 audio-only selection、offline cache miss/hit、長錄音 chunking 同實際 SRT sync。
+
+## 10. Traceability
+
+`scripts/transcribe-qwen3-baseline.sh` 同 batch variant 保留早期 Qwen CLI command line，方便比較 adapter output。Baseline 支援範圍唔等於 canonical v1 contract；正式功能只以 `mrp extract`／`mrp export`、本 spec 同 JSON Schema 為準。

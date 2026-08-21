@@ -1,0 +1,27 @@
+{
+  "schema_version": "1.0",
+  "status": "completed",
+  "run_id": "fixture-run",
+  "attempts": [
+    {
+      "attempt_id": "attempt-1-qwen3",
+      "backend": "qwen3",
+      "model": "test/qwen3",
+      "status": "completed",
+      "raw_segments": []
+    }
+  ],
+  "selected_attempt_id": "attempt-1-qwen3",
+  "transcript": {
+    "language": "Cantonese",
+    "text": "今日我哋開始開會。",
+    "segments": [
+      {
+        "start": 0.0,
+        "end": 2.5,
+        "text": "今日我哋開始開會。",
+        "timing_source": "model"
+      }
+    ]
+  }
+}

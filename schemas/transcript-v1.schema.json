@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Meeting Recording Processor transcript package v1",
+  "type": "object",
+  "required": ["schema_version", "status", "run_id", "attempts", "transcript"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "status": {"enum": ["completed", "failed"]},
+    "run_id": {"type": "string", "minLength": 1},
+    "created_at": {"type": "string"},
+    "source": {"type": "object"},
+    "request": {"type": "object"},
+    "attempts": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/attempt"}
+    },
+    "selected_attempt_id": {"type": ["string", "null"]},
+    "transcript": {
+      "oneOf": [
+        {"$ref": "#/$defs/transcript"},
+        {"type": "null"}
+      ]
+    },
+    "processing": {"type": "object"},
+    "warnings": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "error": {"type": ["string", "null"]},
+    "output": {"type": "string"},
+    "tool": {"type": "object"}
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"status": {"const": "completed"}},
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "attempts": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/attempt"}},
+          "selected_attempt_id": {"type": "string", "minLength": 1},
+          "transcript": {"$ref": "#/$defs/transcript"}
+        },
+        "required": ["selected_attempt_id", "transcript"]
+      },
+      "else": {
+        "properties": {
+          "selected_attempt_id": {"type": "null"},
+          "transcript": {"type": "null"}
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "segment": {
+      "type": "object",
+      "required": ["start", "end", "text", "timing_source"],
+      "properties": {
+        "start": {"type": "number", "minimum": 0},
+        "end": {"type": "number", "exclusiveMinimum": 0},
+        "text": {"type": "string", "minLength": 1},
+        "timing_source": {
+          "enum": ["model", "chunk", "estimated_from_chunk", "estimated_from_duration"]
+        }
+      },
+      "additionalProperties": true
+    },
+    "quality": {
+      "type": "object",
+      "required": ["hard_failure", "reasons"],
+      "properties": {
+        "hard_failure": {"type": "boolean"},
+        "reasons": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "non_whitespace_characters": {"type": "integer", "minimum": 0},
+        "substantive_characters": {"type": "integer", "minimum": 0},
+        "punctuation_or_symbol_ratio": {"type": "number", "minimum": 0, "maximum": 1},
+        "active_audio_seconds": {"type": ["number", "null"], "minimum": 0}
+      },
+      "additionalProperties": true
+    },
+    "attempt": {
+      "type": "object",
+      "required": ["attempt_id", "backend", "model", "status"],
+      "properties": {
+        "attempt_id": {"type": "string", "minLength": 1},
+        "backend": {"enum": ["qwen3", "sensevoice"]},
+        "model": {"type": "string", "minLength": 1},
+        "model_snapshot": {"type": ["string", "null"]},
+        "status": {"enum": ["completed", "hard_failure", "error"]},
+        "started_at": {"type": "string"},
+        "completed_at": {"type": "string"},
+        "runtime_seconds": {"type": "number", "minimum": 0},
+        "raw_text": {"type": "string"},
+        "raw_segments": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/segment"}
+        },
+        "quality": {"$ref": "#/$defs/quality"},
+        "metadata": {"type": "object"},
+        "warnings": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "error": {"type": ["string", "null"]}
+      },
+      "additionalProperties": true
+    },
+    "transcript": {
+      "type": "object",
+      "required": ["language", "text", "segments"],
+      "properties": {
+        "language": {"type": "string", "minLength": 1},
+        "text": {"type": "string", "minLength": 1},
+        "segments": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/segment"}
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}
