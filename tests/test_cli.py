@@ -6,7 +6,12 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from meeting_recording_processor.cli import _run_batch, _run_download, build_parser
+from meeting_recording_processor.cli import (
+    _run_batch,
+    _run_doctor,
+    _run_download,
+    build_parser,
+)
 from meeting_recording_processor.errors import ConfigurationError
 from meeting_recording_processor.models import ResolvedModel
 
@@ -78,6 +83,28 @@ class CliTests(unittest.TestCase):
                 args.vibevoice_model,
             ],
         )
+
+    def test_doctor_prints_vibevoice_mps_runtime_status(self) -> None:
+        args = build_parser().parse_args(["doctor"])
+        output = StringIO()
+        report = {
+            "platform": {"system": "Darwin", "machine": "arm64"},
+            "python": {"version": "3.12.0"},
+            "commands": {},
+            "packages": {},
+            "runtime": {"vibevoice-mps": {"available": False}},
+            "models": {},
+            "cache_dir": "/tmp/cache",
+            "healthy": False,
+        }
+        with (
+            patch("meeting_recording_processor.cli.doctor_report", return_value=report),
+            redirect_stdout(output),
+        ):
+            result = _run_doctor(args)
+
+        self.assertEqual(result, 1)
+        self.assertIn("MISSING runtime:vibevoice-mps", output.getvalue())
 
     def test_batch_reports_file_index_and_total(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

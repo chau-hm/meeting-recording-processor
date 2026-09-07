@@ -39,7 +39,7 @@
 |---|---|---|
 | `qwen3` | `mlx-qwen3-asr==0.3.5`, `Qwen/Qwen3-ASR-1.7B` | 單一 attempt；失敗不 fallback |
 | `sensevoice` | `mlx-audio==0.4.1`, `mlx-community/SenseVoiceSmall` | 單一 attempt；30 秒 chunk inference |
-| `vibevoice` | `torch`, `transformers>=5.3.0,<5.4.0`, `microsoft/VibeVoice-ASR-HF` | explicit evaluation；MPS、24 kHz、最多 60 分鐘；失敗不 fallback |
+| `vibevoice` | `torch`, `transformers>=5.3.0,<5.4.0`, `microsoft/VibeVoice-ASR-HF` | explicit evaluation；MPS、24 kHz、FP32、最多 60 分鐘；失敗不 fallback |
 | `auto` | Qwen3 + SenseVoice | 先 Qwen3；只因 hard failure fallback；不包括 VibeVoice |
 
 Backend imports 同 model load 必須 lazy；CLI help、schema、export、unit tests 唔應觸發 MLX/Transformers import 或下載。
@@ -70,12 +70,14 @@ Qwen3 attempt 符合任一條件時，`auto` 先執行 SenseVoice：
 - canonical text 只做 Unicode NFC、control/whitespace normalization、OpenCC `s2hk` 同 subtitle cue grouping。
 - 唔翻譯、唔摘要、唔將廣東話改寫成普通話書面語。
 - context file 係 opt-in；path、SHA-256 同 backend limitation 寫入 JSON。
-- VibeVoice 嘅 `--language` 不作 model conditioning，只記錄為 metadata；`profile_text` 只經 verified `prompt` interface 傳入。
+- `request.language` 係 user/default request；`transcript.language` 只代表 backend 已知／檢測到嘅語言。
+- VibeVoice 嘅 `--language` 不作 model conditioning 或 detection；只記錄 `metadata.requested_language`，`metadata.language_mode` 為 `not_detected`，canonical `transcript.language` 為 `und`。`profile_text` 只經 verified `prompt` interface 傳入。
 
 ### FR-07 Timing
 
 - Qwen word/model timestamps 轉成 canonical segments，`timing_source` 為 `model`。
-- VibeVoice 有效 structured `Start`／`End` records 轉成 canonical segments，`timing_source` 為 `model`；speaker id 只保留喺 attempt metadata。
+- VibeVoice 只有完整 structured `Start`／`End`／`Content` records 全部通過 validation 先會轉成 canonical segments，`timing_source` 為 `model`；speaker id 只保留喺 attempt metadata。
+- VibeVoice 任何 malformed／incomplete structured record 都會令該 attempt 使用零個 model segments；完整 transcription text 會保留，postprocessor 改用 project 嘅 estimated timing path，並保留 raw／parse diagnostics。
 - Qwen 如只得 chunk timing，或 SenseVoice chunk output，cue timing必須標成估算來源。
 - 完全冇 timestamp 時，按 audio duration 同文字長度估算，並加入 warning。
 - SRT 只由 canonical segments 產生，唔聲稱 estimated timing 係 word-level timestamp。
@@ -187,6 +189,7 @@ Normative machine-readable schema：`schemas/transcript-v1.schema.json`。
 
 - **Privacy：** runtime 不 upload media、transcript、context 或 metadata。
 - **Auditability：** model id/snapshot、attempt raw output、fallback reason、版本、hash 可追溯。
+- **VibeVoice runtime readiness：** `doctor` 分開報告 `torch`／`transformers` package presence 同 `torch.backends.mps.is_available()`；MPS unavailable 時 `healthy` 為 false。
 - **Determinism：** media parameters、post-processing、quality thresholds 固定。
 - **Safety：** input immutable、output fail-on-collision、atomic write、scoped work cleanup。
 - **Testability：** platform/media/model/backend 全部可注入 fake；unit tests 無需大型 model。
@@ -204,7 +207,7 @@ Normative machine-readable schema：`schemas/transcript-v1.schema.json`。
 - [x] unit/integration tests 無需真 model。
 - [x] TTY/plain progress、indeterminate fallback、batch file reporting 同 failure cleanup。
 - [x] shell wrappers、baseline preservation、完整文件同 JSON Schema。
-- [x] VibeVoice explicit backend、native Transformers model management、24 kHz media path、metadata provenance 同 model-free tests。
+- [x] VibeVoice explicit backend、native Transformers model management、24 kHz media path、FP32 MPS contract、all-or-nothing structured timing、language provenance、MPS doctor readiness 同 model-free tests。
 - [ ] Apple Silicon 實機下載兩個 models 並完成真實 M4A/MP3/WAV/FLAC/MP4/MOV smoke test。
 - [ ] Apple Silicon 實機下載 VibeVoice、MPS offline inference 同 structured speaker/timestamp smoke test。
 - [ ] Apple Silicon 上產生／驗證 `uv.lock` 同量度 cache/runtime disk usage。

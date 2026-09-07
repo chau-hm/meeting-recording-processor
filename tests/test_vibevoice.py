@@ -34,6 +34,9 @@ class FakeBatch(dict):
 class FakeProcessor:
     from_pretrained_calls: list[tuple[str, dict]] = []
     request_calls: list[tuple[str, str | None]] = []
+    raw_payload: object = [
+        'assistant[{"Start":0.0,"End":5.2,"Speaker":0,"Content":"我哋今日開始開會。"}]'
+    ]
     parsed_payload: object = [
         {
             "Start": 0.0,
@@ -48,6 +51,7 @@ class FakeProcessor:
             "Content": "OK，下一個 item。",
         },
     ]
+    transcription_payload: object = ["我哋今日開始開會。 OK，下一個 item。"]
 
     @classmethod
     def from_pretrained(cls, path: str, **kwargs):
@@ -62,25 +66,25 @@ class FakeProcessor:
         if return_format == "parsed":
             return [self.parsed_payload]
         if return_format == "transcription_only":
-            return ["我哋今日開始開會。 OK，下一個 item。"]
-        return [
-            'assistant[{"Start":0.0,"End":5.2,"Speaker":0,"Content":"我哋今日開始開會。"}]'
-        ]
+            return self.transcription_payload
+        return self.raw_payload
 
 
 class FakeModel:
     from_pretrained_calls: list[tuple[str, dict]] = []
+    to_calls: list[str] = []
 
-    def __init__(self) -> None:
+    def __init__(self, dtype: object) -> None:
         self.device = "cpu"
-        self.dtype = "torch.bfloat16"
+        self.dtype = dtype
 
     @classmethod
     def from_pretrained(cls, path: str, **kwargs):
         cls.from_pretrained_calls.append((path, kwargs))
-        return cls()
+        return cls(kwargs["dtype"])
 
     def to(self, device: str):
+        self.to_calls.append(device)
         self.device = device
         return self
 
@@ -94,6 +98,7 @@ class FakeModel:
 def fake_runtime(*, mps_available: bool = True) -> tuple[ModuleType, ModuleType]:
     torch_module = ModuleType("torch")
     torch_module.__version__ = "2.test"
+    torch_module.float32 = "torch.float32"
     torch_module.backends = SimpleNamespace(
         mps=SimpleNamespace(is_available=lambda: mps_available)
     )
@@ -111,6 +116,10 @@ class VibeVoiceTests(unittest.TestCase):
         FakeProcessor.from_pretrained_calls.clear()
         FakeProcessor.request_calls.clear()
         FakeModel.from_pretrained_calls.clear()
+        FakeModel.to_calls.clear()
+        FakeProcessor.raw_payload = [
+            'assistant[{"Start":0.0,"End":5.2,"Speaker":0,"Content":"我哋今日開始開會。"}]'
+        ]
         FakeProcessor.parsed_payload = [
             {
                 "Start": 0.0,
@@ -125,6 +134,7 @@ class VibeVoiceTests(unittest.TestCase):
                 "Content": "OK，下一個 item。",
             },
         ]
+        FakeProcessor.transcription_payload = ["我哋今日開始開會。 OK，下一個 item。"]
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.audio = self.root / "audio-24k.wav"
@@ -163,6 +173,15 @@ class VibeVoiceTests(unittest.TestCase):
         self.assertIn("assistant", result.metadata["raw_output"])
         self.assertEqual(result.metadata["model_snapshot"], "snapshot-test")
         self.assertTrue(result.metadata["context_provided"])
+        self.assertEqual(result.language, "und")
+        self.assertEqual(result.metadata["language_mode"], "not_detected")
+        self.assertEqual(result.metadata["requested_language"], "Cantonese")
+        self.assertEqual(result.metadata["dtype"], "torch.float32")
+        self.assertEqual(FakeModel.to_calls, ["mps"])
+        self.assertEqual(
+            FakeModel.from_pretrained_calls[0][1]["dtype"],
+            torch_module.float32,
+        )
         self.assertEqual(FakeProcessor.from_pretrained_calls[0][0], str(self.model_path))
         self.assertTrue(
             all(
@@ -178,8 +197,28 @@ class VibeVoiceTests(unittest.TestCase):
         self.assertFalse(progress_events[0].determinate)
         self.assertIsNone(progress_events[0].percentage)
 
-    def test_malformed_structured_output_keeps_transcription_only_text(self) -> None:
-        FakeProcessor.parsed_payload = "not parsed JSON"
+    def test_malformed_record_rejects_all_model_timing_but_keeps_full_text(self) -> None:
+        FakeProcessor.parsed_payload = [
+            {
+                "Start": 0.0,
+                "End": 5.0,
+                "Speaker": 0,
+                "Content": "第一段。",
+            },
+            {
+                "Start": 5.0,
+                "End": "malformed",
+                "Speaker": 1,
+                "Content": "中間段落。",
+            },
+            {
+                "Start": 10.0,
+                "End": 15.0,
+                "Speaker": 0,
+                "Content": "第三段。",
+            },
+        ]
+        FakeProcessor.transcription_payload = ["第一段。 中間段落。 第三段。"]
         torch_module, transformers_module = fake_runtime()
         with patch.dict(
             "sys.modules",
@@ -194,10 +233,60 @@ class VibeVoiceTests(unittest.TestCase):
                 profile_text=None,
             )
 
-        self.assertEqual(result.text, "我哋今日開始開會。 OK，下一個 item。")
+        self.assertEqual(result.text, "第一段。 中間段落。 第三段。")
         self.assertEqual(result.segments, ())
         self.assertEqual(result.metadata["structured_segments"], [])
+        self.assertFalse(result.metadata["structured_parse_valid"])
         self.assertTrue(any("model timestamps" in warning for warning in result.warnings))
+
+    def test_parsed_raw_string_is_not_accepted_as_structured_output(self) -> None:
+        raw_markup = 'assistant\n[{"Start":0.0,"End":5.0,"Speaker":0,"Content":"第一段。"}]'
+        FakeProcessor.parsed_payload = raw_markup
+        FakeProcessor.transcription_payload = ["第一段。"]
+        torch_module, transformers_module = fake_runtime()
+        with patch.dict(
+            "sys.modules",
+            {"torch": torch_module, "transformers": transformers_module},
+        ):
+            result = VibeVoiceBackend(
+                model_id="microsoft/VibeVoice-ASR-HF",
+                model_path=self.model_path,
+            ).transcribe(
+                self.audio,
+                language="Cantonese",
+                profile_text=None,
+            )
+
+        self.assertEqual(result.text, "第一段。")
+        self.assertEqual(result.segments, ())
+        self.assertFalse(result.metadata["structured_parse_valid"])
+        self.assertEqual(result.metadata["structured_output"], [raw_markup])
+
+    def test_transcription_only_raw_markup_is_rejected_and_preserved(self) -> None:
+        raw_markup = 'assistant\n[{"Start":0.0,"End":5.0,"Speaker":0,"Content":"第一段。"}]'
+        FakeProcessor.raw_payload = [raw_markup]
+        FakeProcessor.parsed_payload = raw_markup
+        FakeProcessor.transcription_payload = [raw_markup]
+        torch_module, transformers_module = fake_runtime()
+        with patch.dict(
+            "sys.modules",
+            {"torch": torch_module, "transformers": transformers_module},
+        ):
+            with self.assertRaisesRegex(BackendError, "raw model markup") as caught:
+                VibeVoiceBackend(
+                    model_id="microsoft/VibeVoice-ASR-HF",
+                    model_path=self.model_path,
+                ).transcribe(
+                    self.audio,
+                    language="Cantonese",
+                    profile_text=None,
+                )
+
+        self.assertEqual(caught.exception.metadata["raw_output"], raw_markup)
+        self.assertEqual(
+            caught.exception.metadata["transcription_only_output"],
+            [raw_markup],
+        )
 
     def test_mps_is_required_and_no_cpu_fallback_is_used(self) -> None:
         torch_module, transformers_module = fake_runtime(mps_available=False)

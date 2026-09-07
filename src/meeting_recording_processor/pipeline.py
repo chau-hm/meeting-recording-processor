@@ -154,6 +154,8 @@ class Extractor:
                 resolved: ResolvedModel | None = None
                 backend_result: BackendResult | None = None
                 error: str | None = None
+                error_metadata: dict[str, Any] = {}
+                error_warnings: tuple[str, ...] = ()
                 try:
                     if index == 1:
                         progress.emit_phase(
@@ -178,6 +180,10 @@ class Extractor:
                     attempt_status = "hard_failure" if quality_report.hard_failure else "completed"
                 except Exception as exc:
                     error = str(exc)
+                    metadata = getattr(exc, "metadata", {})
+                    error_metadata = metadata if isinstance(metadata, dict) else {}
+                    warnings = getattr(exc, "warnings", ())
+                    error_warnings = warnings if isinstance(warnings, tuple) else ()
                     quality = inspect_text(
                         "", active_audio_seconds=signal.active_audio_seconds
                     ).to_dict()
@@ -199,8 +205,8 @@ class Extractor:
                     raw_text=backend_result.text if backend_result else "",
                     raw_segments=backend_result.segments if backend_result else (),
                     quality=quality,
-                    metadata=backend_result.metadata if backend_result else {},
-                    warnings=backend_result.warnings if backend_result else (),
+                    metadata=backend_result.metadata if backend_result else error_metadata,
+                    warnings=backend_result.warnings if backend_result else error_warnings,
                     error=error,
                 )
                 attempts.append(attempt)

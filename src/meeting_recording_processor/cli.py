@@ -269,6 +269,9 @@ def _run_doctor(args: argparse.Namespace) -> int:
             state = "OK" if detail["available"] else "MISSING"
             version = f" ({detail['version']})" if detail.get("version") else ""
             print(f"{state:7} package:{name}{version}")
+        for name, detail in report["runtime"].items():
+            state = "OK" if detail["available"] else "MISSING"
+            print(f"{state:7} runtime:{name}")
         for name, detail in report["models"].items():
             state = "OK" if detail["available"] else "MISSING"
             suffix = (

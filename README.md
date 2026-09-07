@@ -16,7 +16,7 @@ Apple Silicon 上完全本機運行嘅廣東話會議轉錄工具。輸入錄音
 - `qwen3`：`mlx-qwen3-asr==0.3.5` + `Qwen/Qwen3-ASR-1.7B`
 - `sensevoice`：`mlx-audio==0.4.1` + `mlx-community/SenseVoiceSmall`
 - `vibevoice`：native `transformers>=5.3.0,<5.4.0` + `microsoft/VibeVoice-ASR-HF`
-  （24 kHz、MPS、目前最多單次 60 分鐘；explicit evaluation backend）
+  （24 kHz、MPS、FP32、目前最多單次 60 分鐘；explicit evaluation backend）
 - runtime 一律 offline；只有明確執行 `download-model` 先會連網
 - 保留廣東話／中英夾雜，canonical output 以 OpenCC `s2hk` 轉為香港繁體，唔翻譯或改寫內容
 
@@ -51,8 +51,11 @@ uv run mrp extract /path/to/meeting.mp4 --asr auto
 uv run mrp extract /path/to/meeting.m4a --asr vibevoice
 ```
 
-VibeVoice 需要 Apple Silicon MPS，輸入會保留為 24 kHz；原生 speaker/timestamp
-information 會保留喺 attempt metadata，但 canonical transcript 暫時唔啟用 diarization。
+VibeVoice 需要 Apple Silicon MPS，輸入會保留為 24 kHz，現時 verified MPS path 使用 FP32；
+大型 model 可能需要比 checkpoint on-disk／BF16 size 多得多嘅 unified memory，唔會自動
+fallback 到 CPU。`--language` 只保留喺 request／attempt metadata，VibeVoice 唔用佢做
+conditioning 或 language detection，所以 canonical transcript language 會係 `und`；原生
+speaker/timestamp information 會保留喺 attempt metadata，但 canonical transcript 暫時唔啟用 diarization。
 
 確認 JSON 後，先另外 export：
 
@@ -91,11 +94,13 @@ uv run mrp extract meeting.wav --asr sensevoice --output-dir output/sensevoice-r
 uv run mrp extract meeting.m4a \
   --context-file profiles/examples/loq-technical-meeting.txt
 
-# 檢查 runtime、models 同 cache
+# 檢查 runtime、MPS readiness、models 同 cache
 uv run mrp doctor
 uv run mrp cache-size
 ```
 
+`doctor` 會將 `torch`／`transformers` package presence 同 `runtime:vibevoice-mps`
+分開列出；package 裝咗唔代表 MPS 可用，MPS unavailable 時整體 `healthy` 會係 false。
 預設 context 係 `profiles/generic.txt`。LOQ vocabulary 只係 opt-in example，核心程式冇 hard-code domain data。
 
 ## 轉錄進度
@@ -170,8 +175,11 @@ output/
 └── meeting.srt
 ```
 
-Qwen3 同 VibeVoice 原生 model timestamps 會標記為 `timing_source: "model"`。VibeVoice 嘅
-speaker id 同 raw structured output 只保留喺 attempt metadata，唔會改 canonical schema。
+Qwen3 同 VibeVoice 原生 model timestamps 會標記為 `timing_source: "model"`。VibeVoice 只會喺
+完整 structured result 通過 validation 時使用 model timing；任何 malformed／incomplete record
+都會令該 attempt 完全放棄 model timing，保留完整 text 並由 project 嘅 estimated timing path
+處理。VibeVoice 嘅 speaker id、raw structured output 同 parse diagnostics 只保留喺 attempt metadata，
+唔會改 canonical schema。
 SenseVoiceSmall 冇 word-level timestamps，本程式會先保留 30 秒 chunk timing，再按文字長度建立 cue；
 JSON 會標記 `timing_source: "estimated_from_chunk"` 並加入 warning。
 

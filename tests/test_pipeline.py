@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from meeting_recording_processor.asr.qwen3 import Qwen3Backend
 from meeting_recording_processor.config import AsrMode, ExtractConfig
-from meeting_recording_processor.errors import TranscriptionFailed
+from meeting_recording_processor.errors import BackendError, TranscriptionFailed
 from meeting_recording_processor.media.probe import AudioStream, MediaMetadata
 from meeting_recording_processor.media.signal import AudioSignalStats
 from meeting_recording_processor.models import ResolvedModel
@@ -60,12 +60,35 @@ class ReportingBackend(FakeBackend):
 
 
 def result(backend: str, text: str) -> BackendResult:
+    language = (
+        "Cantonese"
+        if backend == "qwen3"
+        else "und"
+        if backend == "vibevoice"
+        else "yue"
+    )
+    metadata = (
+        {
+            "requested_language": "Cantonese",
+            "language_mode": "not_detected",
+        }
+        if backend == "vibevoice"
+        else {}
+    )
     return BackendResult(
-        language="Cantonese" if backend == "qwen3" else "yue",
+        language=language,
         backend=backend,
         model=f"test/{backend}",
         text=text,
-        segments=(TranscriptSegment(0.0, 5.0, text, "model" if backend == "qwen3" else "chunk"),),
+        segments=(
+            TranscriptSegment(
+                0.0,
+                5.0,
+                text,
+                "model" if backend in {"qwen3", "vibevoice"} else "chunk",
+            ),
+        ),
+        metadata=metadata,
     )
 
 
@@ -184,6 +207,49 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(qwen.calls, 0)
         self.assertEqual(sensevoice.calls, 0)
         self.assertEqual(self.normalization_rates, [24000])
+        package = load_package(extracted.output_path, require_completed=True)
+        self.assertEqual(package["request"]["language"], "Cantonese")
+        self.assertEqual(package["attempts"][0]["metadata"]["requested_language"], "Cantonese")
+        self.assertEqual(package["attempts"][0]["metadata"]["language_mode"], "not_detected")
+        self.assertEqual(package["transcript"]["language"], "und")
+
+    def test_vibevoice_rejected_timing_preserves_complete_text_for_estimation(self) -> None:
+        transcript_text = "第一段。 中間段落。 第三段。"
+        vibevoice = FakeBackend(
+            BackendResult(
+                language="und",
+                backend="vibevoice",
+                model="test/vibevoice",
+                text=transcript_text,
+                segments=(),
+                metadata={
+                    "requested_language": "Cantonese",
+                    "language_mode": "not_detected",
+                    "structured_parse_valid": False,
+                },
+                warnings=("structured timing rejected",),
+            )
+        )
+        extracted = self.extractor(
+            {"vibevoice": vibevoice, "qwen3": FakeBackend(result("qwen3", "不應執行。"))},
+        ).extract(self.config(AsrMode.VIBEVOICE))
+
+        package = load_package(extracted.output_path, require_completed=True)
+        self.assertEqual(package["transcript"]["text"], transcript_text)
+        estimated_text = " ".join(
+            segment["text"] for segment in package["transcript"]["segments"]
+        )
+        self.assertIn("第一段。", estimated_text)
+        self.assertIn("中間段落。", estimated_text)
+        self.assertIn("第三段。", estimated_text)
+        self.assertTrue(
+            all(
+                segment["timing_source"] == "estimated_from_duration"
+                for segment in package["transcript"]["segments"]
+            )
+        )
+        self.assertEqual(package["transcript"]["language"], "und")
+        self.assertEqual(package["attempts"][0]["raw_segments"], [])
 
     def test_explicit_vibevoice_failure_writes_diagnostic_without_fallback(self) -> None:
         vibevoice = FakeBackend(RuntimeError("VibeVoice model crash"))
@@ -200,6 +266,30 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(package["attempts"][0]["backend"], "vibevoice")
         self.assertEqual(qwen.calls, 0)
         self.assertEqual(sensevoice.calls, 0)
+
+    def test_vibevoice_failure_preserves_raw_output_metadata(self) -> None:
+        raw_output = 'assistant\n[{"Start":0.0,"End":5.0,"Content":"第一段。"}]'
+        vibevoice = FakeBackend(
+            BackendError(
+                "structured output was not trustworthy",
+                metadata={
+                    "raw_output": raw_output,
+                    "structured_parse_valid": False,
+                },
+                warnings=("structured timing rejected",),
+            )
+        )
+
+        with self.assertRaises(TranscriptionFailed) as caught:
+            self.extractor({"vibevoice": vibevoice}).extract(
+                self.config(AsrMode.VIBEVOICE)
+            )
+
+        package = load_package(caught.exception.diagnostic_path)
+        attempt = package["attempts"][0]
+        self.assertEqual(attempt["metadata"]["raw_output"], raw_output)
+        self.assertFalse(attempt["metadata"]["structured_parse_valid"])
+        self.assertEqual(attempt["warnings"], ["structured timing rejected"])
 
     def test_backend_exception_is_preserved_before_fallback(self) -> None:
         qwen = FakeBackend(RuntimeError("model crash"))

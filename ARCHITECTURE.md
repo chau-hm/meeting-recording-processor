@@ -79,7 +79,7 @@ stateDiagram-v2
 | `pipeline.py` | lifecycle、routing、attempt preservation | 不輸出 TXT/SRT |
 | `schema_io.py` | validation、atomic JSON/text writes | 不做 ASR |
 | `outputs/writers.py` | completed JSON → TXT/SRT | 拒絕 failed JSON |
-| `diagnostics.py` | platform/package/model availability report | 不修復或下載 |
+| `diagnostics.py` | platform/package/model availability 同 VibeVoice MPS capability report | 不修復、下載或載入 model |
 
 ## 4. Backend contract
 
@@ -122,10 +122,11 @@ class AsrBackend(Protocol):
 
 - 使用 pinned `transformers>=5.3.0,<5.4.0` native `AutoProcessor` 同 `VibeVoiceAsrForConditionalGeneration`；
 - extract 只傳入 model resolver 回傳嘅 local snapshot，並以 `local_files_only=True` 建立 processor/model；
-- 要求可用 Apple Silicon MPS；模型使用 checkpoint/config 提供嘅 dtype，唔會隱藏 fallback 到 CPU；
+- 要求可用 Apple Silicon MPS；現時以 `dtype=torch.float32` 明確載入並驗證實際 model dtype，唔會隱藏 fallback 到 CPU；FP32 可能需要較多 unified memory；
 - `apply_transcription_request(audio=local_wav, prompt=profile_text or None)` 對應 context hint；
-- `decode(..., return_format="transcription_only")` 供 quality gate，`return_format="parsed"` 嘅有效 Start/End/Content 轉成 model-timed segments；
-- speaker id、raw decoded output 同 device/dtype/runtime provenance 保留喺 attempt metadata；canonical schema 暫不加入 speaker。
+- 完整 `decode(..., return_format="parsed")` records 通過 Start/End/Content validation 先轉成 model-timed segments；任何 malformed/incomplete record 都會令所有 model segments 歸零；
+- structured parse 失敗時，只接受明確唔等於 raw model output 嘅 `transcription_only` text；否則以 `BackendError` fail closed，避免 JSON/model markup 進入 quality gate；
+- speaker id、raw decoded output、parse diagnostics 同 device/dtype/runtime provenance 保留喺 attempt metadata；canonical schema 暫不加入 speaker。
 
 ## 5. Quality gate
 
@@ -148,10 +149,10 @@ JSON 係 extract 唯一 output、亦係 export 唯一 input。主要區域：
 | Field | Content |
 |---|---|
 | `source` | absolute path、name、size、SHA-256、media/signal metadata |
-| `request` | mode、language、context/hash、models、`offline: true` |
+| `request` | mode、user/default `language` request、context/hash、models、`offline: true` |
 | `attempts` | raw text/segments、quality、errors、runtime、snapshot |
 | `selected_attempt_id` | 成功 attempt pointer；failed 時為 null |
-| `transcript` | Traditional canonical text/segments；failed 時為 null |
+| `transcript` | Traditional canonical text/segments 同 backend-known language；VibeVoice 未檢測時為 `language: "und"`；failed 時為 null |
 | `processing` | deterministic transforms、optional retained work path |
 | `tool` | Python/package/platform/ffprobe provenance |
 
@@ -195,7 +196,7 @@ input (read-only)
 
 ## 8. Offline model lifecycle
 
-`download-model` 係唯一 network-aware path：Hugging Face cache environment 設為 online 並下載 snapshot。`extract` 每次都重新設成 offline，加 `local_files_only=True` resolve；cache miss 轉成 domain error，絕不傳 media 到 remote service。VibeVoice 嘅 native processor/model 亦只接受 local snapshot path，唔會喺 extract 以 model id 觸發 remote fetch。
+`download-model` 係唯一 network-aware path：Hugging Face cache environment 設為 online 並下載 snapshot。`extract` 每次都重新設成 offline，加 `local_files_only=True` resolve；cache miss 轉成 domain error，絕不傳 media 到 remote service。VibeVoice 嘅 native processor/model 亦只接受 local snapshot path，唔會喺 extract 以 model id 觸發 remote fetch。`doctor` 只會 import torch 並檢查 `torch.backends.mps.is_available()`，唔會載入 VibeVoice model；MPS capability 會獨立列喺 `runtime.vibevoice-mps`，並納入 `healthy`。
 
 ## 9. Verification strategy
 

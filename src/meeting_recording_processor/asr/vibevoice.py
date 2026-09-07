@@ -56,7 +56,7 @@ def _first_text(value: object) -> str:
         if not value:
             return ""
         value = value[0]
-    return value if isinstance(value, str) else str(value or "")
+    return value if isinstance(value, str) else ""
 
 
 def _first_parsed(value: object) -> object:
@@ -75,16 +75,16 @@ def _snapshot_from_path(path: Path) -> str | None:
 
 def _parsed_segments(
     parsed: object,
-) -> tuple[tuple[TranscriptSegment, ...], list[dict[str, object]]]:
-    if not isinstance(parsed, list):
-        return (), []
+) -> tuple[tuple[TranscriptSegment, ...], list[dict[str, object]], bool, str | None]:
+    if not isinstance(parsed, list) or not parsed:
+        return (), [], False, "decoded structured output was not a non-empty list"
 
     segments: list[TranscriptSegment] = []
     structured: list[dict[str, object]] = []
     previous_start = -1.0
-    for item in parsed:
+    for index, item in enumerate(parsed):
         if not isinstance(item, dict):
-            continue
+            return (), [], False, f"record {index} was not an object"
         text = item.get("Content")
         start = _finite_number(item.get("Start"))
         end = _finite_number(item.get("End"))
@@ -97,7 +97,7 @@ def _parsed_segments(
             or end <= start
             or start < previous_start
         ):
-            continue
+            return (), [], False, f"record {index} had invalid Start, End, or Content"
         speaker = item.get("Speaker")
         if not isinstance(speaker, (str, int, float, bool)) and speaker is not None:
             speaker = str(speaker)
@@ -117,7 +117,48 @@ def _parsed_segments(
             }
         )
         previous_start = start
-    return tuple(segments), structured
+    return tuple(segments), structured, True, None
+
+
+def _diagnostic_value(value: object) -> object:
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    if isinstance(value, dict):
+        return {str(key): _diagnostic_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_diagnostic_value(item) for item in value]
+    return repr(value)
+
+
+def _join_structured_text(structured: list[dict[str, object]]) -> str:
+    return " ".join(
+        item["text"] for item in structured if isinstance(item.get("text"), str)
+    ).strip()
+
+
+def _normalise_for_comparison(value: str) -> str:
+    return " ".join(value.split())
+
+
+def _is_clean_transcription(
+    candidate: str,
+    *,
+    raw_output: str,
+    parsed: object,
+) -> bool:
+    candidate_normalized = _normalise_for_comparison(candidate.strip())
+    if not candidate_normalized:
+        return False
+    raw_values = [raw_output]
+    if isinstance(parsed, str):
+        raw_values.append(parsed)
+    return all(
+        candidate_normalized != _normalise_for_comparison(value.strip())
+        for value in raw_values
+        if value.strip()
+    )
 
 
 def _mps_available(torch_module: Any) -> bool:
@@ -173,6 +214,7 @@ class VibeVoiceBackend:
             ) from exc
 
         try:
+            mps_dtype = torch_module.float32
             processor = processor_class.from_pretrained(
                 str(self.model_path),
                 local_files_only=True,
@@ -180,16 +222,22 @@ class VibeVoiceBackend:
             model = model_class.from_pretrained(
                 str(self.model_path),
                 local_files_only=True,
+                dtype=mps_dtype,
             )
             model = model.to("mps")
             model.eval()
+            dtype = getattr(model, "dtype", None)
+            if dtype is None or str(dtype) != str(mps_dtype):
+                raise BackendError(
+                    "VibeVoice MPS path requires torch.float32; "
+                    f"loaded dtype was {dtype}"
+                )
         except Exception as exc:
             raise BackendError(f"VibeVoice model 載入失敗：{exc}") from exc
 
         device = getattr(model, "device", "mps")
         if not str(device).startswith("mps"):
             raise BackendError(f"VibeVoice 未能使用 MPS device：{device}")
-        dtype = getattr(model, "dtype", None)
 
         report_progress = isolate_progress_callback(progress_callback)
         if report_progress is not None:
@@ -206,10 +254,7 @@ class VibeVoiceBackend:
                 audio=str(audio_path),
                 prompt=profile_text or None,
             )
-            if dtype is None:
-                inputs = inputs.to(device)
-            else:
-                inputs = inputs.to(device, dtype)
+            inputs = inputs.to(device)
             input_ids = inputs["input_ids"]
             input_length = int(input_ids.shape[1])
             inference_mode = getattr(torch_module, "inference_mode", None)
@@ -226,27 +271,25 @@ class VibeVoiceBackend:
             raise BackendError(f"VibeVoice raw output decode 失敗：{exc}") from exc
 
         warnings = [_SPEAKER_METADATA_WARNING, _LANGUAGE_METADATA_WARNING]
+        parsed_decoded: object = None
+        parsed: object = None
+        structured_parse_error: str | None = None
         try:
-            parsed = _first_parsed(
-                processor.decode(generated_ids, return_format="parsed")
-            )
+            parsed_decoded = processor.decode(generated_ids, return_format="parsed")
+            parsed = _first_parsed(parsed_decoded)
         except Exception as exc:
-            parsed = None
-            warnings.append(f"VibeVoice structured output parse 失敗：{exc}")
+            structured_parse_error = str(exc)
 
-        segments, structured_segments = _parsed_segments(parsed)
-        if not segments:
+        segments, structured_segments, structured_valid, validation_error = _parsed_segments(
+            parsed
+        )
+        if not structured_valid:
+            structured_parse_error = structured_parse_error or validation_error
             warnings.append(
-                "VibeVoice structured output 冇提供可用 model timestamps；"
-                "post-processing 會按 project contract 處理"
+                "VibeVoice structured output timing rejected "
+                f"({structured_parse_error}); no model timestamps used and "
+                "post-processing will estimate timing from the complete text"
             )
-
-        try:
-            text = _first_text(
-                processor.decode(generated_ids, return_format="transcription_only")
-            )
-        except Exception as exc:
-            raise BackendError(f"VibeVoice transcription-only decode 失敗：{exc}") from exc
 
         metadata = {
             "device": str(device),
@@ -256,13 +299,46 @@ class VibeVoiceBackend:
             "model_id": self.model_id,
             "model_snapshot": _snapshot_from_path(self.model_path),
             "context_provided": bool(profile_text),
-            "language_mode": "metadata_only",
+            "language_mode": "not_detected",
             "requested_language": language,
             "raw_output": raw_output,
+            "structured_output": _diagnostic_value(parsed_decoded),
+            "structured_parse_valid": structured_valid,
+            "structured_parse_error": structured_parse_error,
             "structured_segments": structured_segments,
         }
+        if structured_valid:
+            text = _join_structured_text(structured_segments)
+        else:
+            try:
+                transcription_only_decoded = processor.decode(
+                    generated_ids,
+                    return_format="transcription_only",
+                )
+                text = _first_text(transcription_only_decoded)
+            except Exception as exc:
+                metadata["transcription_only_error"] = str(exc)
+                raise BackendError(
+                    f"VibeVoice transcription-only decode 失敗：{exc}",
+                    metadata=metadata,
+                    warnings=tuple(warnings),
+                ) from exc
+            metadata["transcription_only_output"] = _diagnostic_value(
+                transcription_only_decoded
+            )
+            if not _is_clean_transcription(
+                text,
+                raw_output=raw_output,
+                parsed=parsed,
+            ):
+                raise BackendError(
+                    "VibeVoice structured parsing failed and transcription-only "
+                    "output was raw model markup rather than clean speech text",
+                    metadata=metadata,
+                    warnings=tuple(warnings),
+                )
         return BackendResult(
-            language=language,
+            language="und",
             backend=self.name,
             model=self.model_id,
             text=text,
