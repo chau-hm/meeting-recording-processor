@@ -12,6 +12,28 @@ from ..schemas import BackendResult
 ProgressCallback = Callable[[ProgressEvent], None]
 
 
+def isolate_progress_callback(
+    callback: ProgressCallback | None,
+) -> ProgressCallback | None:
+    """Keep non-critical callback failures outside the inference boundary."""
+
+    if callback is None:
+        return None
+
+    enabled = True
+
+    def report(event: ProgressEvent) -> None:
+        nonlocal enabled
+        if not enabled:
+            return
+        try:
+            callback(event)
+        except Exception:
+            enabled = False
+
+    return report
+
+
 class AsrBackend(Protocol):
     name: str
     model_id: str

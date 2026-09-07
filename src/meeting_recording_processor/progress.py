@@ -31,6 +31,19 @@ class ProgressMode(StrEnum):
 
 Clock = Callable[[], float]
 
+_PHASE_ORDER = {
+    ProgressPhase.PREPARING.value: 0,
+    ProgressPhase.LOADING_MODEL.value: 1,
+    ProgressPhase.TRANSCRIBING.value: 2,
+    ProgressPhase.WRITING_OUTPUT.value: 3,
+    ProgressPhase.COMPLETED.value: 4,
+    ProgressPhase.FAILED.value: 4,
+}
+_TERMINAL_PHASES = {
+    ProgressPhase.COMPLETED.value,
+    ProgressPhase.FAILED.value,
+}
+
 
 def resolve_progress_mode(value: str | ProgressMode | None = None) -> ProgressMode:
     """Resolve an explicit mode or ``ASR_PROGRESS`` without changing defaults."""
@@ -139,44 +152,47 @@ class ProgressRenderer:
     ) -> None:
         self.mode = resolve_progress_mode(mode)
         self.stream = stream if stream is not None else sys.stderr
+        self._disabled = False
         isatty = getattr(self.stream, "isatty", None)
-        self.interactive = bool(isatty()) if callable(isatty) else False
+        try:
+            self.interactive = bool(isatty()) if callable(isatty) else False
+        except Exception:
+            self.interactive = False
+            self._disabled = True
         self.log_interval_seconds = max(0.0, log_interval_seconds)
         self.log_step_percentage = max(0.0, log_step_percentage)
         self._last_phase: str | None = None
         self._last_percentage: float | None = None
         self._last_elapsed = 0.0
+        self._last_message: str | None = None
         self._last_line_width = 0
         self._line_active = False
-        self._pending_final: ProgressEvent | None = None
         self._closed = False
 
     @property
     def enabled(self) -> bool:
-        return self.mode is not ProgressMode.OFF
+        return (
+            self.mode is not ProgressMode.OFF
+            and not self._disabled
+            and not self._closed
+        )
 
     def render(self, event: ProgressEvent) -> None:
         if not self.enabled or self._closed:
             return
-        if (
-            event.phase == ProgressPhase.TRANSCRIBING.value
-            and event.percentage is not None
-            and event.percentage >= 100.0
-        ):
-            self._pending_final = event
-            return
-        if event.phase == ProgressPhase.COMPLETED.value and self._pending_final is not None:
-            pending = self._pending_final
-            self._pending_final = None
-            self._render_now(pending)
-        elif event.phase == ProgressPhase.FAILED.value:
-            self._pending_final = None
-        elif event.phase not in {
-            ProgressPhase.TRANSCRIBING.value,
-            ProgressPhase.WRITING_OUTPUT.value,
-        }:
-            self._pending_final = None
-        self._render_now(event)
+        try:
+            if not self._phase_is_allowed(event.phase):
+                return
+            self._render_now(event)
+        except Exception:
+            self.disable()
+
+    def disable(self) -> None:
+        """Permanently stop progress output after a renderer failure."""
+
+        self._disabled = True
+        self._line_active = False
+        self._closed = True
 
     def _render_now(self, event: ProgressEvent) -> None:
         if not self.interactive and not self._should_log(event):
@@ -195,20 +211,30 @@ class ProgressRenderer:
             )
             self.stream.flush()
         self._last_phase = event.phase
-        self._last_percentage = event.percentage
+        if event.percentage is not None:
+            self._last_percentage = event.percentage
+        elif event.phase != ProgressPhase.TRANSCRIBING.value:
+            self._last_percentage = None
         self._last_elapsed = event.elapsed
+        self._last_message = event.message
 
     def close(self) -> None:
         if self._closed:
             return
-        if self.interactive and self._line_active:
-            self.stream.write("\n")
-            self.stream.flush()
+        try:
+            if self.interactive and self._line_active:
+                self.stream.write("\n")
+                self.stream.flush()
+        except Exception:
+            self.disable()
+        finally:
             self._line_active = False
-        self._closed = True
+            self._closed = True
 
     def _should_log(self, event: ProgressEvent) -> bool:
         if self._last_phase != event.phase:
+            return True
+        if event.message != self._last_message:
             return True
         if event.phase in {ProgressPhase.COMPLETED.value, ProgressPhase.FAILED.value}:
             return True
@@ -222,6 +248,19 @@ class ProgressRenderer:
             if percentage >= 100.0 and self._last_percentage < 100.0:
                 return True
         return event.elapsed - self._last_elapsed >= self.log_interval_seconds
+
+    def _phase_is_allowed(self, phase: str) -> bool:
+        if self._last_phase is None:
+            return True
+        if self._last_phase in _TERMINAL_PHASES and phase != self._last_phase:
+            return False
+        previous_order = _PHASE_ORDER.get(self._last_phase)
+        current_order = _PHASE_ORDER.get(phase)
+        return (
+            previous_order is None
+            or current_order is None
+            or current_order >= previous_order
+        )
 
     def _write_tty(self, text: str, *, final: bool) -> None:
         padding = max(0, self._last_line_width - len(text))
@@ -356,6 +395,11 @@ class ProgressReporter:
     def finished(self) -> bool:
         return self._finished
 
+    @property
+    def current_phase(self) -> str | None:
+        with self._lock:
+            return self._last_event.phase if self._last_event is not None else None
+
     def start(self, message: str = "Preparing audio...") -> None:
         if self._finished:
             return
@@ -403,15 +447,22 @@ class ProgressReporter:
                 else self.file_total,
                 file_name=event.file_name if event.file_name is not None else self.file_name,
             )
+            if self._last_event is not None and not self._phase_is_allowed(
+                self._last_event.phase, enriched.phase
+            ):
+                return
             self._last_event = enriched
-            self.renderer.render(enriched)
+            try:
+                self.renderer.render(enriched)
+            except Exception:
+                self.renderer.disable()
 
     def complete(self, message: str = "") -> None:
         if self._finished:
             return
         self._stop_heartbeat()
         self.emit_phase(ProgressPhase.COMPLETED, message=message)
-        self.renderer.close()
+        self._close_renderer()
         self._finished = True
 
     def fail(self, message: str = "") -> None:
@@ -419,14 +470,20 @@ class ProgressReporter:
             return
         self._stop_heartbeat()
         self.emit_phase(ProgressPhase.FAILED, message=message)
-        self.renderer.close()
+        self._close_renderer()
         self._finished = True
 
     def close(self) -> None:
         if not self._finished:
             self._stop_heartbeat()
-            self.renderer.close()
+            self._close_renderer()
             self._finished = True
+
+    def _close_renderer(self) -> None:
+        try:
+            self.renderer.close()
+        except Exception:
+            self.renderer.disable()
 
     def _start_heartbeat(self) -> None:
         if self._heartbeat_thread is not None:
@@ -447,8 +504,42 @@ class ProgressReporter:
 
     def _heartbeat_loop(self) -> None:
         while not self._heartbeat_stop.wait(self._heartbeat_seconds):
-            with self._lock:
-                if self._finished or self._last_event is None:
-                    continue
-                event = self._last_event
-            self.emit(event)
+            if not self.renderer.enabled:
+                return
+            self._heartbeat_tick()
+
+    def _heartbeat_tick(self) -> None:
+        """Render the current event while holding the state lock."""
+
+        with self._lock:
+            if (
+                self._finished
+                or self._last_event is None
+                or not self.renderer.enabled
+            ):
+                return
+            started_at = self._started_at
+            enriched = replace(
+                self._last_event,
+                elapsed=max(
+                    0.0,
+                    self._clock() - (started_at if started_at is not None else self._clock()),
+                ),
+            )
+            self._last_event = enriched
+            try:
+                self.renderer.render(enriched)
+            except Exception:
+                self.renderer.disable()
+
+    @staticmethod
+    def _phase_is_allowed(previous: str, current: str) -> bool:
+        if previous in _TERMINAL_PHASES and current != previous:
+            return False
+        previous_order = _PHASE_ORDER.get(previous)
+        current_order = _PHASE_ORDER.get(current)
+        return (
+            previous_order is None
+            or current_order is None
+            or current_order >= previous_order
+        )

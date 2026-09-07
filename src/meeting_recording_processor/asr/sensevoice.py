@@ -10,7 +10,7 @@ import wave
 from ..errors import BackendError, MediaError
 from ..progress import ProgressEvent, ProgressPhase
 from ..schemas import BackendResult, TranscriptSegment
-from .base import ProgressCallback
+from .base import ProgressCallback, isolate_progress_callback
 
 BACKEND_NAME = "sensevoice"
 DEFAULT_MODEL_ID = "mlx-community/SenseVoiceSmall"
@@ -94,6 +94,7 @@ class SenseVoiceBackend:
             raise BackendError(f"SenseVoice 唔支援 language value：{language}")
 
         warnings: list[str] = []
+        report_progress = isolate_progress_callback(progress_callback)
         if profile_text:
             warnings.append("SenseVoice adapter 不支援 context hotwords；已保留設定但冇注入 model")
 
@@ -113,8 +114,8 @@ class SenseVoiceBackend:
                 raise MediaError("SenseVoice input 必須係 16-bit mono WAV")
             frames_per_chunk = max(1, int(sample_rate * self.chunk_seconds))
             total_duration = source.getnframes() / sample_rate if sample_rate else None
-            if progress_callback is not None:
-                progress_callback(
+            if report_progress is not None:
+                report_progress(
                     ProgressEvent(
                         phase=ProgressPhase.TRANSCRIBING,
                         current=0.0,
@@ -167,8 +168,8 @@ class SenseVoiceBackend:
                     )
                 offset_frames += written_frames
                 chunk_index += 1
-                if progress_callback is not None:
-                    progress_callback(
+                if report_progress is not None:
+                    report_progress(
                         ProgressEvent(
                             phase=ProgressPhase.TRANSCRIBING,
                             current=offset_frames / sample_rate,

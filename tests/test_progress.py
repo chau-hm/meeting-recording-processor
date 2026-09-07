@@ -1,6 +1,8 @@
 from io import StringIO
 import unittest
+from unittest.mock import patch
 
+from meeting_recording_processor.asr.base import isolate_progress_callback
 from meeting_recording_processor.asr.qwen3 import _progress_event
 from meeting_recording_processor.progress import (
     ProgressEvent,
@@ -16,6 +18,21 @@ from meeting_recording_processor.progress import (
 class TtyStringIO(StringIO):
     def isatty(self) -> bool:
         return True
+
+
+class BrokenStream:
+    def __init__(self) -> None:
+        self.write_calls = 0
+
+    def isatty(self) -> bool:
+        return False
+
+    def write(self, _value: str) -> int:
+        self.write_calls += 1
+        raise BrokenPipeError("closed stream")
+
+    def flush(self) -> None:
+        raise BrokenPipeError("closed stream")
 
 
 class ProgressTests(unittest.TestCase):
@@ -77,6 +94,24 @@ class ProgressTests(unittest.TestCase):
         reporter.complete()
         self.assertEqual(output.getvalue(), "")
 
+    def test_renderer_disables_after_first_stream_failure(self) -> None:
+        stream = BrokenStream()
+        renderer = ProgressRenderer(mode="on", stream=stream)
+        event = ProgressEvent(phase=ProgressPhase.PREPARING, message="Preparing")
+        renderer.render(event)
+        renderer.render(event)
+        self.assertFalse(renderer.enabled)
+        self.assertEqual(stream.write_calls, 1)
+
+    def test_progress_callback_preserves_keyboard_interrupt(self) -> None:
+        def interrupt(_event: ProgressEvent) -> None:
+            raise KeyboardInterrupt
+
+        callback = isolate_progress_callback(interrupt)
+        assert callback is not None
+        with self.assertRaises(KeyboardInterrupt):
+            callback(ProgressEvent(phase=ProgressPhase.PREPARING))
+
     def test_failure_does_not_report_completion(self) -> None:
         output = StringIO()
         reporter = ProgressReporter(mode="on", stream=output)
@@ -84,9 +119,9 @@ class ProgressTests(unittest.TestCase):
         reporter.fail("backend error")
         rendered = output.getvalue()
         self.assertIn("Transcription failed", rendered)
-        self.assertNotIn("Completed in", rendered)
+        self.assertNotIn("Completed", rendered)
 
-    def test_pending_final_percentage_is_discarded_on_failure(self) -> None:
+    def test_final_percentage_is_rendered_before_failure(self) -> None:
         output = StringIO()
         renderer = ProgressRenderer(mode="on", stream=output)
         renderer.render(
@@ -100,8 +135,41 @@ class ProgressTests(unittest.TestCase):
             ProgressEvent(phase=ProgressPhase.FAILED, message="backend error")
         )
         rendered = output.getvalue()
-        self.assertNotIn("progress=100%", rendered)
+        self.assertIn("progress=100%", rendered)
         self.assertIn("Transcription failed", rendered)
+        self.assertNotIn("Completed", rendered)
+
+    def test_success_phases_are_rendered_in_order(self) -> None:
+        output = StringIO()
+        renderer = ProgressRenderer(mode="on", stream=output)
+        renderer.render(ProgressEvent(phase=ProgressPhase.PREPARING, message="Preparing"))
+        renderer.render(
+            ProgressEvent(phase=ProgressPhase.LOADING_MODEL, message="Loading")
+        )
+        renderer.render(
+            ProgressEvent(
+                phase=ProgressPhase.TRANSCRIBING,
+                current=10,
+                total=10,
+            )
+        )
+        renderer.render(
+            ProgressEvent(
+                phase=ProgressPhase.WRITING_OUTPUT,
+                message="Writing transcript files...",
+            )
+        )
+        renderer.render(ProgressEvent(phase=ProgressPhase.COMPLETED))
+        rendered = output.getvalue()
+        markers = [
+            "[preparing]",
+            "[load-model]",
+            "progress=100%",
+            "[write-output]",
+            "Completed elapsed=",
+        ]
+        positions = [rendered.index(marker) for marker in markers]
+        self.assertEqual(positions, sorted(positions))
 
     def test_batch_context_is_preserved_on_events(self) -> None:
         output = StringIO()
@@ -120,7 +188,38 @@ class ProgressTests(unittest.TestCase):
             )
         )
         self.assertEqual(reporter.file_index, 3)
+        self.assertIn("File 3 of 8: meeting-03.m4a", output.getvalue())
         self.assertIn("progress=50%", output.getvalue())
+
+    def test_heartbeat_renders_current_phase_after_transition(self) -> None:
+        reporter = ProgressReporter(mode="on", stream=StringIO())
+        rendered_events: list[ProgressEvent] = []
+        with patch.object(
+            reporter.renderer,
+            "render",
+            side_effect=lambda event: rendered_events.append(event),
+        ):
+            reporter.emit(
+                ProgressEvent(
+                    phase=ProgressPhase.TRANSCRIBING,
+                    current=1,
+                    total=2,
+                )
+            )
+            reporter.emit_phase(
+                ProgressPhase.WRITING_OUTPUT,
+                message="Writing transcript files...",
+            )
+            reporter._heartbeat_tick()
+
+        self.assertEqual(
+            [event.phase for event in rendered_events],
+            [
+                ProgressPhase.TRANSCRIBING.value,
+                ProgressPhase.WRITING_OUTPUT.value,
+                ProgressPhase.WRITING_OUTPUT.value,
+            ],
+        )
 
     def test_qwen_structured_progress_uses_processed_audio(self) -> None:
         event = _progress_event(

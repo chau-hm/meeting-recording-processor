@@ -83,6 +83,8 @@ Qwen3 attempt 符合任一條件時，`auto` 先執行 SenseVoice：
 - TTY 使用 compact updating display；非 TTY 只輸出 plain log lines，唔包含 cursor-control escape sequences。
 - `ASR_PROGRESS=auto|on|off` 控制 progress output，亦可用 `--progress`；預設係 `auto`。
 - `batch` 顯示 current file index、total files、filename，同 current file 嘅 progress；唔以檔案數量冒充 duration-weighted aggregate。
+- Progress renderer 或 backend callback 出現普通 I/O／reporting exception 時必須 fail open：停用後續 progress output，但唔可以改變 ASR、quality gate 或 fallback；`KeyboardInterrupt` 仍然要傳出。
+- Rendered lifecycle phases 只可以向前行；successful run 順序係 `transcribing → writing-output → completed`，failed run 絕不輸出 `completed`。
 
 ### FR-08 Output and collision safety
 
@@ -95,6 +97,8 @@ Qwen3 attempt 符合任一條件時，`auto` 先執行 SenseVoice：
 JSON 包含 source metadata/hash、request、immutable attempts、selected attempt、canonical transcript、processing、warnings、error 同 tool provenance。所有文字檔以 temp file + `fsync` + atomic replace 寫入。
 
 預設不覆蓋任何已存在 output；只有明確 `--overwrite` 可以取代。所有 attempts 都嵌入 JSON，避免 fallback 證據散失。
+
+`batch` 必須喺第一個 `extract` 前預先計算全部 `<input-stem>.transcript.json` destinations，並拒絕同 stem 或 macOS case-insensitive 等價 destination 嘅 input collision。`--overwrite` 唔可以繞過 intra-batch collision；collision error 必須列出 conflicting inputs 同 shared destination。
 
 `export` 同時 preflight TXT/SRT collision；failed 或無效 JSON 一律拒絕：
 

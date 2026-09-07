@@ -63,6 +63,8 @@ Shell wrappers 提供同一功能：
 # 或：uv run mrp batch recordings/
 ```
 
+Batch 會按檔名排序，並喺第一個檔案開始前預先檢查全部 stem-based transcript destinations。相同 stem（例如 `meeting.m4a` 同 `meeting.mp3`）或 macOS case-insensitive 等價 destination 會直接拒絕，並列出 conflicting inputs；即使加 `--overwrite` 都唔會容許一個 input 覆蓋同一批次另一個 input。
+
 常用選項：
 
 ```bash
@@ -115,6 +117,7 @@ Transcribing [##########----------] 51%  32:28 / 1:03:42  Elapsed: 14:02
 ```
 
 非互動 output 會保留 phase、percentage（如有）、processed／total duration 同 elapsed，方便 redirect 到 log。
+Progress output 係 observability side channel；如果 stderr 或 backend callback stream 失效，會停用後續 progress，但 transcription 會繼續，亦唔會因此觸發 fallback。
 
 ## `auto` fallback 規則
 

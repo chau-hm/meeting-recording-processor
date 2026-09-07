@@ -107,6 +107,33 @@ def _paths(args: argparse.Namespace) -> tuple[Path, Path, Path, Path | None]:
     return output_dir, work_dir, cache_dir, context_file
 
 
+def _preflight_batch_output_collisions(
+    files: list[Path],
+    output_dir: Path,
+) -> None:
+    destinations: dict[str, tuple[Path, list[Path]]] = {}
+    for input_path in files:
+        destination = (
+            output_dir / f"{input_path.stem}.transcript.json"
+        ).expanduser().resolve()
+        key = str(destination).casefold()
+        entry = destinations.setdefault(key, (destination, []))
+        entry[1].append(input_path)
+
+    collisions = [entry for entry in destinations.values() if len(entry[1]) > 1]
+    if not collisions:
+        return
+
+    details = [
+        f"  {destination}: {', '.join(str(input_path) for input_path in inputs)}"
+        for destination, inputs in collisions
+    ]
+    raise ConfigurationError(
+        "batch output collision(s)；同一批次內唔可以共用 transcript destination：\n"
+        + "\n".join(details)
+    )
+
+
 def _run_extract(args: argparse.Namespace) -> int:
     output_dir, work_dir, cache_dir, context_file = _paths(args)
     result = extract(
@@ -147,7 +174,7 @@ def _run_batch(args: argparse.Namespace) -> int:
                 for path in input_dir.iterdir()
                 if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
             ),
-            key=lambda path: path.name.casefold(),
+            key=lambda path: (path.name.casefold(), path.name),
         )
     except OSError as exc:
         raise ConfigurationError(f"無法讀取 input directory：{exc}") from exc
@@ -156,6 +183,7 @@ def _run_batch(args: argparse.Namespace) -> int:
         raise ConfigurationError(f"目錄內搵唔到支援檔案（{supported}）：{input_dir}")
 
     output_dir, work_dir, cache_dir, context_file = _paths(args)
+    _preflight_batch_output_collisions(files, output_dir)
     show_progress = resolve_progress_mode(args.progress_mode) is not ProgressMode.OFF
     failures = 0
     for index, input_path in enumerate(files, start=1):

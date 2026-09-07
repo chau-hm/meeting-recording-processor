@@ -139,9 +139,23 @@ class Extractor:
                 backend_result: BackendResult | None = None
                 error: str | None = None
                 try:
+                    if index == 1:
+                        loading_phase = ProgressPhase.LOADING_MODEL
+                    elif progress.current_phase in {
+                        None,
+                        ProgressPhase.PREPARING.value,
+                        ProgressPhase.LOADING_MODEL.value,
+                    }:
+                        loading_phase = ProgressPhase.LOADING_MODEL
+                    else:
+                        loading_phase = ProgressPhase.TRANSCRIBING
                     progress.emit_phase(
-                        ProgressPhase.LOADING_MODEL,
-                        message=f"Loading {backend_name} model...",
+                        loading_phase,
+                        message=(
+                            f"Loading {backend_name} model..."
+                            if index == 1
+                            else f"Loading {backend_name} model after fallback..."
+                        ),
                     )
                     resolved = self.model_resolver(model_id, cache_dir)
                     backend = self.backend_factory(
@@ -196,8 +210,18 @@ class Extractor:
                 if config.asr_mode is not AsrMode.AUTO:
                     break
                 if index < len(sequence):
+                    fallback_phase = (
+                        ProgressPhase.LOADING_MODEL
+                        if progress.current_phase
+                        in {
+                            None,
+                            ProgressPhase.PREPARING.value,
+                            ProgressPhase.LOADING_MODEL.value,
+                        }
+                        else ProgressPhase.TRANSCRIBING
+                    )
                     progress.emit_phase(
-                        ProgressPhase.PREPARING,
+                        fallback_phase,
                         message=f"{backend_name} failed; trying {sequence[index]}...",
                     )
 

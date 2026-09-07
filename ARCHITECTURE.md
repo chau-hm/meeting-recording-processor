@@ -152,6 +152,8 @@ preparing → loading-model → transcribing → writing-output → completed
 
 TTY renderer 更新單行；redirect／CI 使用 thresholded plain log lines。`current/total` 只在 backend 提供可靠 audio timestamp、duration 或 chunk count 時標為 determinate。
 
+Renderer 係 observability side channel：stream 或 backend progress callback 出錯時會停用後續 progress，但唔會將 extraction 轉成 backend error。Reporter 以 atomic current-event 更新 heartbeat，並拒絕 delayed/regressive phase，避免 fallback 或 stale heartbeat 將畫面倒退。
+
 ## 7. Filesystem and safety
 
 ```text
@@ -165,6 +167,7 @@ input (read-only)
 - work directory 使用 run-specific name，cleanup 只針對該 directory；
 - `--keep-work-files` 先保存 WAV；
 - default collision policy 係 fail；
+- `batch` 會喺第一個 extraction 前 preflight 全部 stem-based destinations，並以 case-insensitive key 拒絕 intra-batch collision；`--overwrite` 唔會繞過呢個 preflight；
 - temp file同 final output 位於同一 parent，以 `os.replace` 原子提交；
 - JSON 保存 raw attempt，所以 canonical s2hk conversion 不會破壞原始證據。
 
@@ -181,7 +184,7 @@ Backend-independent suite 注入 fake platform/probe/normalizer/signal/model/bac
 - explicit Qwen mode 不 fallback；
 - failed diagnostic JSON、attempt preservation、collision policy；
 - media command construction、signal analysis、text conversion/cue timing；
-- progress event math、TTY/plain/off rendering、backend failure cleanup、unknown duration tolerance、batch file index reporting；
+- progress event math、TTY/plain/off rendering、fail-open stream/callback isolation、monotonic lifecycle/heartbeat ordering、backend failure cleanup、unknown duration tolerance、batch file index/collision preflight；
 - completed/failed schema、TXT/SRT output、CLI defaults。
 
 支援平台上另需 integration smoke tests：兩個 model load、六種 input containers、影片 audio-only selection、offline cache miss/hit、長錄音 chunking 同實際 SRT sync。

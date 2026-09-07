@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..errors import BackendError
 from ..progress import ProgressEvent, ProgressPhase
 from ..schemas import BackendResult, TranscriptSegment
-from .base import ProgressCallback
+from .base import ProgressCallback, isolate_progress_callback
 
 BACKEND_NAME = "qwen3"
 DEFAULT_MODEL_ID = "Qwen/Qwen3-ASR-1.7B"
@@ -93,6 +93,29 @@ def _progress_event(payload: object) -> ProgressEvent | None:
     )
 
 
+def _safe_progress_callback(
+    progress_callback: ProgressCallback | None,
+) -> Callable[[dict[str, Any]], None] | None:
+    isolated = isolate_progress_callback(progress_callback)
+    if isolated is None:
+        return None
+
+    enabled = True
+
+    def on_progress(payload: dict[str, Any]) -> None:
+        nonlocal enabled
+        if not enabled:
+            return
+        try:
+            event = _progress_event(payload)
+            if event is not None:
+                isolated(event)
+        except Exception:
+            enabled = False
+
+    return on_progress
+
+
 class Qwen3Backend:
     name = BACKEND_NAME
 
@@ -109,15 +132,9 @@ class Qwen3Backend:
         profile_text: str | None,
         progress_callback: ProgressCallback | None = None,
     ) -> BackendResult:
+        on_progress = _safe_progress_callback(progress_callback)
         try:
             from mlx_qwen3_asr import transcribe
-
-            def on_progress(payload: dict[str, Any]) -> None:
-                if progress_callback is None:
-                    return
-                event = _progress_event(payload)
-                if event is not None:
-                    progress_callback(event)
 
             result = transcribe(
                 str(audio_path),
@@ -127,7 +144,7 @@ class Qwen3Backend:
                 return_timestamps=True,
                 return_chunks=True,
                 verbose=self.verbose,
-                on_progress=on_progress if progress_callback is not None else None,
+                on_progress=on_progress,
             )
         except Exception as exc:
             raise BackendError(f"Qwen3-ASR 執行失敗：{exc}") from exc
