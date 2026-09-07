@@ -84,7 +84,7 @@ Qwen3 attempt 符合任一條件時，`auto` 先執行 SenseVoice：
 - `ASR_PROGRESS=auto|on|off` 控制 progress output，亦可用 `--progress`；預設係 `auto`。
 - `batch` 顯示 current file index、total files、filename，同 current file 嘅 progress；唔以檔案數量冒充 duration-weighted aggregate。
 - Progress renderer 或 backend callback 出現普通 I/O／reporting exception 時必須 fail open：停用後續 progress output，但唔可以改變 ASR、quality gate 或 fallback；`KeyboardInterrupt` 仍然要傳出。
-- Rendered lifecycle phases 只可以向前行；successful run 順序係 `transcribing → writing-output → completed`，failed run 絕不輸出 `completed`。
+- Rendered lifecycle phases 只可以向前行；成功而無 fallback 嘅 run 順序係 `transcribing → writing-output → completed`。`auto` objective hard failure 會先輸出 backend-neutral `fallback` transition（顯示下一個 model loading），再由下一個 backend 以自己嘅 `transcribing` progress 重新由 0% 開始；failed run 絕不輸出 `completed`。
 
 ### FR-08 Output and collision safety
 

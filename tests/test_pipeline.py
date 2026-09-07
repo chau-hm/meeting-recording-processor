@@ -214,18 +214,35 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(sensevoice.calls, 0)
         self.assertFalse(reporter.enabled)
 
-    def test_fallback_does_not_regress_rendered_phases(self) -> None:
+    def test_fallback_lifecycle_is_visible_and_backend_progress_resets(self) -> None:
         qwen = ReportingBackend(
             result("qwen3", "!!!!!!!!!!"),
             (
                 ProgressEvent(
                     phase=ProgressPhase.TRANSCRIBING,
-                    current=5,
-                    total=5,
+                    current=10,
+                    total=10,
+                    message="Qwen3 transcribing...",
                 ),
             ),
         )
-        sensevoice = FakeBackend(result("sensevoice", "後備辨識成功。"))
+        sensevoice = ReportingBackend(
+            result("sensevoice", "後備辨識成功。"),
+            (
+                ProgressEvent(
+                    phase=ProgressPhase.TRANSCRIBING,
+                    current=0,
+                    total=10,
+                    message="SenseVoice transcribing...",
+                ),
+                ProgressEvent(
+                    phase=ProgressPhase.TRANSCRIBING,
+                    current=1,
+                    total=10,
+                    message="SenseVoice transcribing...",
+                ),
+            ),
+        )
         output = StringIO()
         reporter = ProgressReporter(mode="on", stream=output)
         extracted = self.extractor(
@@ -235,16 +252,64 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(extracted.selected_backend, "sensevoice")
         rendered = output.getvalue()
         markers = [
-            "[transcribe]",
+            "progress=100%",
+            "[fallback]",
+            "progress=0%",
+            "progress=10%",
             "[write-output]",
             "Completed elapsed=",
         ]
         positions = [rendered.index(marker) for marker in markers]
         self.assertEqual(positions, sorted(positions))
-        self.assertNotIn(
-            "[load-model]",
-            rendered[positions[0] :],
+        fallback_line = next(
+            line for line in rendered.splitlines() if line.startswith("[fallback]")
         )
+        self.assertIn("failed objective quality gate", fallback_line)
+        self.assertNotIn("%", fallback_line)
+
+    def test_failed_fallback_does_not_report_completion(self) -> None:
+        qwen = ReportingBackend(
+            result("qwen3", "!!!!!!!!!!"),
+            (
+                ProgressEvent(
+                    phase=ProgressPhase.TRANSCRIBING,
+                    current=10,
+                    total=10,
+                    message="Qwen3 transcribing...",
+                ),
+            ),
+        )
+        sensevoice = ReportingBackend(
+            RuntimeError("SenseVoice model crash"),
+            (
+                ProgressEvent(
+                    phase=ProgressPhase.TRANSCRIBING,
+                    current=0,
+                    total=10,
+                    message="SenseVoice transcribing...",
+                ),
+            ),
+        )
+        output = StringIO()
+        reporter = ProgressReporter(mode="on", stream=output)
+        extractor = self.extractor(
+            {"qwen3": qwen, "sensevoice": sensevoice},
+            progress_factory=lambda _config: reporter,
+        )
+
+        with self.assertRaises(TranscriptionFailed):
+            extractor.extract(self.config())
+
+        rendered = output.getvalue()
+        markers = [
+            "progress=100%",
+            "[fallback]",
+            "progress=0%",
+            "Transcription failed",
+        ]
+        positions = [rendered.index(marker) for marker in markers]
+        self.assertEqual(positions, sorted(positions))
+        self.assertNotIn("Completed", rendered)
 
     def test_qwen_progress_callback_failure_does_not_fail_inference(self) -> None:
         transcript = "我哋今日開始開會。"

@@ -171,6 +171,81 @@ class ProgressTests(unittest.TestCase):
         positions = [rendered.index(marker) for marker in markers]
         self.assertEqual(positions, sorted(positions))
 
+    def test_fallback_phase_resets_percentage_for_next_backend(self) -> None:
+        output = StringIO()
+        renderer = ProgressRenderer(mode="on", stream=output)
+        renderer.render(
+            ProgressEvent(
+                phase=ProgressPhase.TRANSCRIBING,
+                current=10,
+                total=10,
+                message="Qwen3 transcribing...",
+            )
+        )
+        renderer.render(
+            ProgressEvent(
+                phase=ProgressPhase.FALLBACK,
+                message="Fallback to SenseVoice; loading model...",
+            )
+        )
+        renderer.render(
+            ProgressEvent(
+                phase=ProgressPhase.TRANSCRIBING,
+                current=0,
+                total=10,
+                message="SenseVoice transcribing...",
+            )
+        )
+        renderer.render(
+            ProgressEvent(
+                phase=ProgressPhase.TRANSCRIBING,
+                current=1,
+                total=10,
+                message="SenseVoice transcribing...",
+            )
+        )
+
+        lines = output.getvalue().splitlines()
+        fallback_line = next(line for line in lines if line.startswith("[fallback]"))
+        self.assertIn("progress=100%", output.getvalue())
+        self.assertNotIn("%", fallback_line)
+        self.assertIn("progress=0%", output.getvalue())
+        self.assertIn("progress=10%", output.getvalue())
+
+    def test_fallback_phase_allows_same_rank_transition_but_rejects_regression(self) -> None:
+        output = StringIO()
+        renderer = ProgressRenderer(mode="on", stream=output)
+        renderer.render(
+            ProgressEvent(phase=ProgressPhase.TRANSCRIBING, current=1, total=2)
+        )
+        renderer.render(
+            ProgressEvent(
+                phase=ProgressPhase.FALLBACK,
+                message="Fallback to SenseVoice; loading model...",
+            )
+        )
+        renderer.render(
+            ProgressEvent(phase=ProgressPhase.TRANSCRIBING, current=0, total=2)
+        )
+        renderer.render(
+            ProgressEvent(
+                phase=ProgressPhase.WRITING_OUTPUT,
+                message="Writing transcript files...",
+            )
+        )
+        rendered_before_regression = output.getvalue()
+
+        renderer.render(
+            ProgressEvent(
+                phase=ProgressPhase.TRANSCRIBING,
+                current=2,
+                total=2,
+                message="stale transcription",
+            )
+        )
+
+        self.assertEqual(output.getvalue(), rendered_before_regression)
+
     def test_batch_context_is_preserved_on_events(self) -> None:
         output = StringIO()
         reporter = ProgressReporter(
@@ -220,6 +295,53 @@ class ProgressTests(unittest.TestCase):
                 ProgressPhase.WRITING_OUTPUT.value,
             ],
         )
+
+    def test_heartbeat_refreshes_fallback_then_current_backend(self) -> None:
+        reporter = ProgressReporter(mode="on", stream=StringIO())
+        rendered_events: list[ProgressEvent] = []
+        with patch.object(
+            reporter.renderer,
+            "render",
+            side_effect=lambda event: rendered_events.append(event),
+        ):
+            reporter.emit(
+                ProgressEvent(
+                    phase=ProgressPhase.TRANSCRIBING,
+                    current=10,
+                    total=10,
+                    message="Qwen3 transcribing...",
+                )
+            )
+            reporter.emit_phase(
+                ProgressPhase.FALLBACK,
+                message="Fallback to SenseVoice; loading model...",
+            )
+            reporter._heartbeat_tick()
+            reporter.emit(
+                ProgressEvent(
+                    phase=ProgressPhase.TRANSCRIBING,
+                    current=0,
+                    total=10,
+                    message="SenseVoice transcribing...",
+                )
+            )
+            reporter._heartbeat_tick()
+
+        self.assertEqual(
+            [event.phase for event in rendered_events],
+            [
+                ProgressPhase.TRANSCRIBING.value,
+                ProgressPhase.FALLBACK.value,
+                ProgressPhase.FALLBACK.value,
+                ProgressPhase.TRANSCRIBING.value,
+                ProgressPhase.TRANSCRIBING.value,
+            ],
+        )
+        self.assertEqual(
+            rendered_events[2].message,
+            "Fallback to SenseVoice; loading model...",
+        )
+        self.assertEqual(rendered_events[4].message, "SenseVoice transcribing...")
 
     def test_qwen_structured_progress_uses_processed_audio(self) -> None:
         event = _progress_event(

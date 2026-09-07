@@ -97,7 +97,7 @@ export ASR_PROGRESS=off   # 關閉進度輸出
 
 等價嘅單次 command option 係 `--progress auto|on|off`。
 
-進度會顯示目前 phase、elapsed time，同可用嘅 media duration。Qwen3 透過 pinned runtime 嘅 structured `on_progress` callback，以實際已處理 audio seconds／總 duration 計算百分比；SenseVoice 以已完成 chunk 嘅實際 audio duration 報告。若 backend 沒有可靠 total，會顯示 `Transcribing...` 而唔會估算百分比。
+進度會顯示目前 phase、elapsed time，同可用嘅 media duration。Qwen3 透過 pinned runtime 嘅 structured `on_progress` callback，以實際已處理 audio seconds／總 duration 計算百分比；SenseVoice 以已完成 chunk 嘅實際 audio duration 報告。若 backend 沒有可靠 total，會顯示 `Transcribing...` 而唔會估算百分比。`auto` 因 objective hard failure fallback 時，會先顯示 `fallback` transition／下一個 model loading；SenseVoice 開始後，percentage 會由自己嘅 0% 重新計，唔會沿用 Qwen3 嘅進度。
 
 單檔 TTY output 例子：
 
@@ -118,6 +118,14 @@ Transcribing [##########----------] 51%  32:28 / 1:03:42  Elapsed: 14:02
 
 非互動 output 會保留 phase、percentage（如有）、processed／total duration 同 elapsed，方便 redirect 到 log。
 Progress output 係 observability side channel；如果 stderr 或 backend callback stream 失效，會停用後續 progress，但 transcription 會繼續，亦唔會因此觸發 fallback。
+
+Fallback 例子：
+
+```text
+[transcribe] Transcribing progress=100% processed=00:10/00:10 elapsed=00:08
+[fallback] qwen3 failed objective quality gate; falling back to sensevoice and loading model... elapsed=00:08
+[transcribe] Transcribing progress=0% processed=00:00/00:10 elapsed=00:09
+```
 
 ## `auto` fallback 規則
 

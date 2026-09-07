@@ -146,11 +146,15 @@ Segment `timing_source`：
 Progress event phases：
 
 ```text
-preparing → loading-model → transcribing → writing-output → completed
-                                                        ↘ failed
+preparing → loading-model → transcribing
+                              ├─ success → writing-output → completed
+                              └─ objective hard failure + auto fallback
+                                   → fallback → transcribing → ...
 ```
 
 TTY renderer 更新單行；redirect／CI 使用 thresholded plain log lines。`current/total` 只在 backend 提供可靠 audio timestamp、duration 或 chunk count 時標為 determinate。
+
+`fallback` 同 `transcribing` 共用 lifecycle rank，令 `transcribing → fallback → transcribing` 合法；`writing-output` 之後嘅 backward transition 仍然會被拒絕。Fallback event 只顯示 transition/model loading，唔帶 transcription percentage；下一個 backend 嘅 percentage state 重新由自己嘅 0% 計。
 
 Renderer 係 observability side channel：stream 或 backend progress callback 出錯時會停用後續 progress，但唔會將 extraction 轉成 backend error。Reporter 以 atomic current-event 更新 heartbeat，並拒絕 delayed/regressive phase，避免 fallback 或 stale heartbeat 將畫面倒退。
 

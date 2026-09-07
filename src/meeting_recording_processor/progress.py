@@ -18,6 +18,7 @@ class ProgressPhase(StrEnum):
     PREPARING = "preparing"
     LOADING_MODEL = "loading-model"
     TRANSCRIBING = "transcribing"
+    FALLBACK = "fallback"
     WRITING_OUTPUT = "writing-output"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -35,6 +36,7 @@ _PHASE_ORDER = {
     ProgressPhase.PREPARING.value: 0,
     ProgressPhase.LOADING_MODEL.value: 1,
     ProgressPhase.TRANSCRIBING.value: 2,
+    ProgressPhase.FALLBACK.value: 2,
     ProgressPhase.WRITING_OUTPUT.value: 3,
     ProgressPhase.COMPLETED.value: 4,
     ProgressPhase.FAILED.value: 4,
@@ -211,7 +213,9 @@ class ProgressRenderer:
             )
             self.stream.flush()
         self._last_phase = event.phase
-        if event.percentage is not None:
+        if event.phase == ProgressPhase.FALLBACK.value:
+            self._last_percentage = None
+        elif event.percentage is not None:
             self._last_percentage = event.percentage
         elif event.phase != ProgressPhase.TRANSCRIBING.value:
             self._last_percentage = None
@@ -278,6 +282,7 @@ class ProgressRenderer:
     def _plain_prefix(event: ProgressEvent) -> str:
         phase_names = {
             ProgressPhase.TRANSCRIBING.value: "transcribe",
+            ProgressPhase.FALLBACK.value: "fallback",
             ProgressPhase.LOADING_MODEL.value: "load-model",
             ProgressPhase.WRITING_OUTPUT.value: "write-output",
         }
@@ -297,6 +302,9 @@ class ProgressRenderer:
         context = self._file_prefix(event)
         if event.phase == ProgressPhase.TRANSCRIBING.value:
             return context + self._format_transcribing(event)
+        if event.phase == ProgressPhase.FALLBACK.value:
+            message = self._clean_message(event.message) or "Fallback"
+            return context + f"{message}  Elapsed: {format_duration(event.elapsed)}"
         if event.phase == ProgressPhase.COMPLETED.value:
             return context + f"Completed in {format_duration(event.elapsed)}"
         if event.phase == ProgressPhase.FAILED.value:
@@ -325,6 +333,9 @@ class ProgressRenderer:
                 f"Transcribing progress={displayed_percentage}%{processed} "
                 f"elapsed={format_duration(event.elapsed)}"
             )
+        if event.phase == ProgressPhase.FALLBACK.value:
+            message = self._clean_message(event.message) or "Fallback"
+            return f"{message} elapsed={format_duration(event.elapsed)}"
         if event.phase == ProgressPhase.COMPLETED.value:
             return f"Completed elapsed={format_duration(event.elapsed)}"
         if event.phase == ProgressPhase.FAILED.value:

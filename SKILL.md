@@ -28,6 +28,8 @@ uv run mrp extract <input> --asr auto
 
 一般專有名詞、accuracy、punctuation 或 segmentation 問題唔可以觸發自動 fallback。使用者如要求人工重試，另行執行 `--asr sensevoice` 並使用另一 output directory，避免覆蓋第一次 JSON。
 
+如果 `auto` 因客觀 hard failure fallback，進度會先顯示 `fallback` transition 同下一個 model loading，之後由新 backend 重新顯示自己嘅 `transcribing` progress；唔會將 model loading 假裝成 transcription，亦唔會沿用上一個 backend 嘅 percentage。
+
 Extract 成功只會產生：
 
 ```text
