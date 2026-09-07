@@ -10,12 +10,14 @@ from pathlib import Path
 class AsrMode(StrEnum):
     QWEN3 = "qwen3"
     SENSEVOICE = "sensevoice"
+    VIBEVOICE = "vibevoice"
     AUTO = "auto"
 
 
 SUPPORTED_EXTENSIONS = frozenset({".wav", ".m4a", ".mp3", ".flac", ".mp4", ".mov"})
 DEFAULT_QWEN_MODEL = "Qwen/Qwen3-ASR-1.7B"
 DEFAULT_SENSEVOICE_MODEL = "mlx-community/SenseVoiceSmall"
+DEFAULT_VIBEVOICE_MODEL = "microsoft/VibeVoice-ASR-HF"
 
 
 def project_root(start: Path | None = None) -> Path:
@@ -42,6 +44,7 @@ class ExtractConfig:
     context_file: Path | None = None
     qwen_model: str = DEFAULT_QWEN_MODEL
     sensevoice_model: str = DEFAULT_SENSEVOICE_MODEL
+    vibevoice_model: str = DEFAULT_VIBEVOICE_MODEL
     keep_work_files: bool = False
     overwrite: bool = False
     verbose: bool = False

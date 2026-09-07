@@ -77,6 +77,26 @@ class MediaTests(unittest.TestCase):
             self.assertIn("16000", captured)
             self.assertTrue(destination.exists())
 
+    def test_normalize_supports_vibevoice_sample_rate_without_changing_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "normalized-vibevoice.wav"
+            metadata = MediaMetadata("wav", 1.0, (), 0)
+            captured = []
+
+            def runner(command, **_kwargs):
+                captured.extend(command)
+                destination.write_bytes(b"RIFF-placeholder")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            normalize_audio(
+                Path("meeting.wav"),
+                metadata,
+                destination,
+                target_sample_rate=24000,
+                runner=runner,
+            )
+            self.assertIn("24000", captured)
+
     def test_signal_analysis_reports_active_audio(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "tone.wav"

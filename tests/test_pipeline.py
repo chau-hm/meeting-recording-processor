@@ -75,6 +75,7 @@ class PipelineTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.input = self.root / "meeting.m4a"
         self.input.write_bytes(b"private fixture bytes")
+        self.normalization_rates: list[int] = []
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -94,7 +95,8 @@ class PipelineTests(unittest.TestCase):
         )
         signal = AudioSignalStats(5.0, 0.2, 0.5, 5.0, 1.0, 0.01)
 
-        def normalizer(_source, _metadata, destination):
+        def normalizer(_source, _metadata, destination, **_kwargs):
+            self.normalization_rates.append(_kwargs.get("target_sample_rate", 16000))
             destination.write_bytes(b"normalized")
             return destination
 
@@ -140,6 +142,7 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(extracted.fallback_used)
         self.assertEqual(qwen.calls, 1)
         self.assertEqual(sensevoice.calls, 0)
+        self.assertEqual(self.normalization_rates, [16000])
 
     def test_auto_falls_back_on_punctuation_collapse(self) -> None:
         qwen = FakeBackend(result("qwen3", "!!!!!!!!!!"))
@@ -168,6 +171,35 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(sensevoice.calls, 0)
         package = load_package(caught.exception.diagnostic_path)
         self.assertEqual(package["status"], "failed")
+
+    def test_explicit_vibevoice_does_not_fallback_to_existing_backends(self) -> None:
+        vibevoice = FakeBackend(result("vibevoice", "VibeVoice transcript"))
+        qwen = FakeBackend(result("qwen3", "不應執行。"))
+        sensevoice = FakeBackend(result("sensevoice", "不應執行。"))
+        extracted = self.extractor(
+            {"vibevoice": vibevoice, "qwen3": qwen, "sensevoice": sensevoice}
+        ).extract(self.config(AsrMode.VIBEVOICE))
+        self.assertEqual(extracted.selected_backend, "vibevoice")
+        self.assertEqual(vibevoice.calls, 1)
+        self.assertEqual(qwen.calls, 0)
+        self.assertEqual(sensevoice.calls, 0)
+        self.assertEqual(self.normalization_rates, [24000])
+
+    def test_explicit_vibevoice_failure_writes_diagnostic_without_fallback(self) -> None:
+        vibevoice = FakeBackend(RuntimeError("VibeVoice model crash"))
+        qwen = FakeBackend(result("qwen3", "不應執行。"))
+        sensevoice = FakeBackend(result("sensevoice", "不應執行。"))
+        extractor = self.extractor(
+            {"vibevoice": vibevoice, "qwen3": qwen, "sensevoice": sensevoice}
+        )
+        with self.assertRaises(TranscriptionFailed) as caught:
+            extractor.extract(self.config(AsrMode.VIBEVOICE))
+
+        package = load_package(caught.exception.diagnostic_path)
+        self.assertEqual(package["status"], "failed")
+        self.assertEqual(package["attempts"][0]["backend"], "vibevoice")
+        self.assertEqual(qwen.calls, 0)
+        self.assertEqual(sensevoice.calls, 0)
 
     def test_backend_exception_is_preserved_before_fallback(self) -> None:
         qwen = FakeBackend(RuntimeError("model crash"))

@@ -9,7 +9,11 @@ import shutil
 import sys
 from typing import Any
 
-from .config import DEFAULT_QWEN_MODEL, DEFAULT_SENSEVOICE_MODEL
+from .config import (
+    DEFAULT_QWEN_MODEL,
+    DEFAULT_SENSEVOICE_MODEL,
+    DEFAULT_VIBEVOICE_MODEL,
+)
 from .models import resolve_cached_model
 
 
@@ -25,6 +29,7 @@ def doctor_report(cache_dir: Path) -> dict[str, Any]:
     for backend, model_id in (
         ("qwen3", DEFAULT_QWEN_MODEL),
         ("sensevoice", DEFAULT_SENSEVOICE_MODEL),
+        ("vibevoice", DEFAULT_VIBEVOICE_MODEL),
     ):
         try:
             resolved = resolve_cached_model(model_id, cache_dir)
@@ -64,6 +69,14 @@ def doctor_report(cache_dir: Path) -> dict[str, Any]:
             "opencc-python-reimplemented": {
                 "available": util.find_spec("opencc") is not None,
                 "version": _distribution_version("opencc-python-reimplemented"),
+            },
+            "torch": {
+                "available": util.find_spec("torch") is not None,
+                "version": _distribution_version("torch"),
+            },
+            "transformers": {
+                "available": util.find_spec("transformers") is not None,
+                "version": _distribution_version("transformers"),
             },
         },
         "models": models,

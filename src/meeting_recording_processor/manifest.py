@@ -48,6 +48,8 @@ def tool_metadata(*, ffprobe: str | None) -> dict[str, object]:
             "mlx-audio": package_version("mlx-audio"),
             "opencc-python-reimplemented": package_version("opencc-python-reimplemented"),
             "huggingface-hub": package_version("huggingface-hub"),
+            "torch": package_version("torch"),
+            "transformers": package_version("transformers"),
         },
         "ffprobe": ffprobe,
     }

@@ -11,6 +11,7 @@ from .config import (
     AsrMode,
     DEFAULT_QWEN_MODEL,
     DEFAULT_SENSEVOICE_MODEL,
+    DEFAULT_VIBEVOICE_MODEL,
     ExportConfig,
     ExtractConfig,
     SUPPORTED_EXTENSIONS,
@@ -30,7 +31,10 @@ def _add_transcription_options(parser: argparse.ArgumentParser) -> None:
         "--asr",
         choices=[mode.value for mode in AsrMode],
         default=AsrMode.AUTO.value,
-        help="auto 先用 Qwen3，只有客觀 hard failure 先 fallback SenseVoice",
+        help=(
+            "auto 只係 Qwen3 → SenseVoice；"
+            "vibevoice 係 explicit evaluation backend"
+        ),
     )
     parser.add_argument("--language", default="Cantonese")
     parser.add_argument("--context-file", type=Path)
@@ -39,6 +43,7 @@ def _add_transcription_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cache-dir", type=Path)
     parser.add_argument("--qwen-model", default=DEFAULT_QWEN_MODEL)
     parser.add_argument("--sensevoice-model", default=DEFAULT_SENSEVOICE_MODEL)
+    parser.add_argument("--vibevoice-model", default=DEFAULT_VIBEVOICE_MODEL)
     parser.add_argument("--keep-work-files", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--verbose", action="store_true")
@@ -85,10 +90,15 @@ def build_parser() -> argparse.ArgumentParser:
     download_parser = subparsers.add_parser(
         "download-model", help="明確下載本機 ASR model；extract 本身永遠 offline"
     )
-    download_parser.add_argument("--asr", choices=["qwen3", "sensevoice", "all"], default="all")
+    download_parser.add_argument(
+        "--asr",
+        choices=["qwen3", "sensevoice", "vibevoice", "all"],
+        default="all",
+    )
     download_parser.add_argument("--cache-dir", type=Path)
     download_parser.add_argument("--qwen-model", default=DEFAULT_QWEN_MODEL)
     download_parser.add_argument("--sensevoice-model", default=DEFAULT_SENSEVOICE_MODEL)
+    download_parser.add_argument("--vibevoice-model", default=DEFAULT_VIBEVOICE_MODEL)
 
     cache_parser = subparsers.add_parser("cache-size", help="顯示 project-local model cache 大小")
     cache_parser.add_argument("--cache-dir", type=Path)
@@ -147,6 +157,7 @@ def _run_extract(args: argparse.Namespace) -> int:
             context_file=context_file,
             qwen_model=args.qwen_model,
             sensevoice_model=args.sensevoice_model,
+            vibevoice_model=args.vibevoice_model,
             keep_work_files=args.keep_work_files,
             overwrite=args.overwrite,
             verbose=args.verbose,
@@ -201,6 +212,7 @@ def _run_batch(args: argparse.Namespace) -> int:
                     context_file=context_file,
                     qwen_model=args.qwen_model,
                     sensevoice_model=args.sensevoice_model,
+                    vibevoice_model=args.vibevoice_model,
                     keep_work_files=args.keep_work_files,
                     overwrite=args.overwrite,
                     verbose=args.verbose,
@@ -250,10 +262,21 @@ def _run_doctor(args: argparse.Namespace) -> int:
     else:
         print(f"Platform：{report['platform']['system']} {report['platform']['machine']}")
         print(f"Python：{report['python']['version']}")
-        for group in ("commands", "packages", "models"):
-            for name, detail in report[group].items():
-                state = "OK" if detail["available"] else "MISSING"
-                print(f"{state:7} {name}")
+        for name, detail in report["commands"].items():
+            state = "OK" if detail["available"] else "MISSING"
+            print(f"{state:7} command:{name}")
+        for name, detail in report["packages"].items():
+            state = "OK" if detail["available"] else "MISSING"
+            version = f" ({detail['version']})" if detail.get("version") else ""
+            print(f"{state:7} package:{name}{version}")
+        for name, detail in report["models"].items():
+            state = "OK" if detail["available"] else "MISSING"
+            suffix = (
+                f" snapshot={detail['snapshot']}"
+                if detail.get("snapshot")
+                else f" detail={detail.get('detail', 'not available')}"
+            )
+            print(f"{state:7} model:{name}{suffix}")
         print(f"Cache：{report['cache_dir']}")
     return 0 if report["healthy"] else 1
 
@@ -267,6 +290,8 @@ def _run_download(args: argparse.Namespace) -> int:
         targets.append(("qwen3", args.qwen_model))
     if args.asr in {"sensevoice", "all"}:
         targets.append(("sensevoice", args.sensevoice_model))
+    if args.asr in {"vibevoice", "all"}:
+        targets.append(("vibevoice", args.vibevoice_model))
     for backend, model_id in targets:
         print(f"下載 {backend}：{model_id}")
         resolved = download_model(model_id, cache_dir)

@@ -18,20 +18,25 @@ flowchart TD
     BATCH --> B
 ```
 
-外部 AI cleanup、meeting notes 或 action items 唔係本 system component。影片 frame、cloud API 同 speaker identity 都不會進入 data flow。
+外部 AI cleanup、meeting notes 或 action items 唔係本 system component。影片 frame、cloud API 同外部 speaker identity 都不會進入 data flow；VibeVoice 原生 speaker id 只作 attempt metadata。
 
 ## 2. Extract data flow
 
 ```mermaid
 flowchart TD
-    A["Validate + ffprobe"] --> B["16 kHz mono WAV"]
-    B --> C{"ASR mode"}
-    C -->|"qwen3 / auto"| D["Qwen3 adapter"]
-    C -->|"sensevoice"| E["SenseVoice adapter"]
-    D --> F{"Hard failure?"}
-    F -->|"auto + yes"| E
-    F -->|"no"| G["Post-process + JSON"]
-    E --> G
+    A["Validate + ffprobe"] --> B{"Backend sample rate"}
+    B -->|"Qwen3 / SenseVoice"| C["16 kHz mono WAV"]
+    B -->|"VibeVoice"| D["24 kHz mono WAV"]
+    C --> E{"ASR mode"}
+    D --> E
+    E -->|"qwen3 / auto"| F["Qwen3 adapter"]
+    E -->|"sensevoice"| G["SenseVoice adapter"]
+    E -->|"vibevoice"| H["VibeVoice adapter"]
+    F --> I{"Hard failure?"}
+    I -->|"auto + yes"| G
+    I -->|"no"| J["Post-process + JSON"]
+    G --> J
+    H --> J
 ```
 
 Routing state：
@@ -39,17 +44,20 @@ Routing state：
 ```mermaid
 stateDiagram-v2
     [*] --> Qwen3: auto
+    [*] --> VibeVoice: explicit
     Qwen3 --> Selected: usable
     Qwen3 --> SenseVoice: objective hard failure
     SenseVoice --> Selected: usable
     SenseVoice --> Failed: hard failure
+    VibeVoice --> Selected: usable
+    VibeVoice --> Failed: hard failure
     Selected --> Persisted
     Failed --> DiagnosticJSON
     Persisted --> [*]
     DiagnosticJSON --> [*]
 ```
 
-指定 `qwen3` 或 `sensevoice` 時只有一個 attempt。`auto` 都只會有最多兩個；pipeline 唔做 ensemble 或 subjective quality ranking。
+指定 `qwen3`、`sensevoice` 或 `vibevoice` 時只有一個 attempt。`auto` 都只會有最多兩個，而且永遠唔會進入 VibeVoice；pipeline 唔做 ensemble 或 subjective quality ranking。
 
 ## 3. Module map
 
@@ -59,11 +67,12 @@ stateDiagram-v2
 | `config.py` | modes、paths、defaults、supported extensions | 不做 I/O pipeline |
 | `runtime.py` | Darwin/arm64、commands、HF offline env | 不做 inference |
 | `media/probe.py` | ffprobe JSON、audio stream selection | 不 decode transcript |
-| `media/normalize.py` | ffmpeg stream map、PCM WAV | 不改 input |
+| `media/normalize.py` | ffmpeg stream map、backend-specific PCM WAV | 不改 input |
 | `media/signal.py` | duration/RMS/active-audio stats | 不評主觀準確度 |
 | `models.py` | explicit download、offline snapshot resolve | extract 不連網 |
 | `asr/qwen3.py` | Qwen result → `BackendResult` | 不決定 fallback |
 | `asr/sensevoice.py` | WAV chunks → `BackendResult` | 不偽造 word timestamp |
+| `asr/vibevoice.py` | local 24 kHz WAV → native Transformers `BackendResult` | 不改 canonical speaker schema、不 fallback |
 | `progress.py` | backend-neutral events、TTY/plain renderers、elapsed/percentage helpers | 不執行 ASR |
 | `quality.py` | objective hard-failure metrics | 不做內容評分 |
 | `postprocess.py` | NFC、whitespace、s2hk、cue grouping | 不翻譯／摘要／改寫 |
@@ -108,6 +117,15 @@ class AsrBackend(Protocol):
 - 逐個完成 chunk 以實際 audio seconds 報告 progress；
 - 保存 chunk start/end、language/emotion/event（如 runtime 有提供）；
 - 原生冇 word timestamp，postprocessor 對每個 chunk 做 weighted cue estimation。
+
+### VibeVoice
+
+- 使用 pinned `transformers>=5.3.0,<5.4.0` native `AutoProcessor` 同 `VibeVoiceAsrForConditionalGeneration`；
+- extract 只傳入 model resolver 回傳嘅 local snapshot，並以 `local_files_only=True` 建立 processor/model；
+- 要求可用 Apple Silicon MPS；模型使用 checkpoint/config 提供嘅 dtype，唔會隱藏 fallback 到 CPU；
+- `apply_transcription_request(audio=local_wav, prompt=profile_text or None)` 對應 context hint；
+- `decode(..., return_format="transcription_only")` 供 quality gate，`return_format="parsed"` 嘅有效 Start/End/Content 轉成 model-timed segments；
+- speaker id、raw decoded output 同 device/dtype/runtime provenance 保留喺 attempt metadata；canonical schema 暫不加入 speaker。
 
 ## 5. Quality gate
 
@@ -162,7 +180,7 @@ Renderer 係 observability side channel：stream 或 backend progress callback �
 
 ```text
 input (read-only)
-  ├─ work/<stem>-<run-id>/audio-16k-mono.wav   # default cleanup
+  ├─ work/<stem>-<run-id>/audio-<backend-rate>-mono.wav   # default cleanup
   └─ output/<stem>.transcript.json             # atomic write
         ├─ output/<stem>.txt                    # explicit export
         └─ output/<stem>.srt                    # explicit export
@@ -177,7 +195,7 @@ input (read-only)
 
 ## 8. Offline model lifecycle
 
-`download-model` 係唯一 network-aware path：Hugging Face cache environment 設為 online 並下載 snapshot。`extract` 每次都重新設成 offline，加 `local_files_only=True` resolve；cache miss 轉成 domain error，絕不傳 media 到 remote service。
+`download-model` 係唯一 network-aware path：Hugging Face cache environment 設為 online 並下載 snapshot。`extract` 每次都重新設成 offline，加 `local_files_only=True` resolve；cache miss 轉成 domain error，絕不傳 media 到 remote service。VibeVoice 嘅 native processor/model 亦只接受 local snapshot path，唔會喺 extract 以 model id 觸發 remote fetch。
 
 ## 9. Verification strategy
 
@@ -190,8 +208,9 @@ Backend-independent suite 注入 fake platform/probe/normalizer/signal/model/bac
 - media command construction、signal analysis、text conversion/cue timing；
 - progress event math、TTY/plain/off rendering、fail-open stream/callback isolation、monotonic lifecycle/heartbeat ordering、backend failure cleanup、unknown duration tolerance、batch file index/collision preflight；
 - completed/failed schema、TXT/SRT output、CLI defaults。
+- VibeVoice model-free adapter mapping、MPS/offline guard、24 kHz normalization、duration limit、indeterminate progress 同 explicit-only routing。
 
-支援平台上另需 integration smoke tests：兩個 model load、六種 input containers、影片 audio-only selection、offline cache miss/hit、長錄音 chunking 同實際 SRT sync。
+支援平台上另需 integration smoke tests：三個 model family load、六種 input containers、影片 audio-only selection、offline cache miss/hit、VibeVoice 60 分鐘 limit 同實際 SRT sync。
 
 ## 10. Traceability
 

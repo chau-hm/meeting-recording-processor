@@ -15,10 +15,13 @@ Apple Silicon 上完全本機運行嘅廣東話會議轉錄工具。輸入錄音
 - 影片只讀 audio stream；唔分析畫面、唔做 OCR
 - `qwen3`：`mlx-qwen3-asr==0.3.5` + `Qwen/Qwen3-ASR-1.7B`
 - `sensevoice`：`mlx-audio==0.4.1` + `mlx-community/SenseVoiceSmall`
+- `vibevoice`：native `transformers>=5.3.0,<5.4.0` + `microsoft/VibeVoice-ASR-HF`
+  （24 kHz、MPS、目前最多單次 60 分鐘；explicit evaluation backend）
 - runtime 一律 offline；只有明確執行 `download-model` 先會連網
 - 保留廣東話／中英夾雜，canonical output 以 OpenCC `s2hk` 轉為香港繁體，唔翻譯或改寫內容
 
-v1 明確不包括 speaker diarization、Whisper、cloud ASR、live captions、影片 OCR／frame analysis、自動會議紀錄。
+v1 唔會將 VibeVoice 原生 speaker attribution promotion 成 canonical diarization schema；
+亦明確不包括 Whisper、cloud ASR、live captions、影片 OCR／frame analysis、自動會議紀錄。
 
 ## 安裝
 
@@ -31,6 +34,7 @@ chmod +x setup.sh scripts/*.sh
 ```
 
 `setup.sh` 建立 `.venv`；model 下載到 project-local `.cache/huggingface/`。模型下載完成後，`extract` 只會讀 local cache，缺少 asset 時會 fail closed。
+VibeVoice model 較大；`./scripts/download-models.sh` 會連同三個支援 model family 一次下載。
 
 ## 使用方法
 
@@ -40,6 +44,15 @@ chmod +x setup.sh scripts/*.sh
 uv run mrp extract /path/to/meeting.mp4 --asr auto
 # output/meeting.transcript.json
 ```
+
+`auto` 固定係 Qwen3 → SenseVoice；VibeVoice 目前只會喺明確指定時執行：
+
+```bash
+uv run mrp extract /path/to/meeting.m4a --asr vibevoice
+```
+
+VibeVoice 需要 Apple Silicon MPS，輸入會保留為 24 kHz；原生 speaker/timestamp
+information 會保留喺 attempt metadata，但 canonical transcript 暫時唔啟用 diarization。
 
 確認 JSON 後，先另外 export：
 
@@ -97,7 +110,7 @@ export ASR_PROGRESS=off   # 關閉進度輸出
 
 等價嘅單次 command option 係 `--progress auto|on|off`。
 
-進度會顯示目前 phase、elapsed time，同可用嘅 media duration。Qwen3 透過 pinned runtime 嘅 structured `on_progress` callback，以實際已處理 audio seconds／總 duration 計算百分比；SenseVoice 以已完成 chunk 嘅實際 audio duration 報告。若 backend 沒有可靠 total，會顯示 `Transcribing...` 而唔會估算百分比。`auto` 因 objective hard failure fallback 時，會先顯示 `fallback` transition／下一個 model loading；SenseVoice 開始後，percentage 會由自己嘅 0% 重新計，唔會沿用 Qwen3 嘅進度。
+進度會顯示目前 phase、elapsed time，同可用嘅 media duration。Qwen3 透過 pinned runtime 嘅 structured `on_progress` callback，以實際已處理 audio seconds／總 duration 計算百分比；SenseVoice 以已完成 chunk 嘅實際 audio duration 報告。VibeVoice 目前冇 verified processed-audio progress source，因此 transcription phase 係 indeterminate，只顯示 elapsed time。若 backend 沒有可靠 total，會顯示 `Transcribing...` 而唔會估算百分比。`auto` 因 objective hard failure fallback 時，會先顯示 `fallback` transition／下一個 model loading；SenseVoice 開始後，percentage 會由自己嘅 0% 重新計，唔會沿用 Qwen3 嘅進度。
 
 單檔 TTY output 例子：
 
@@ -137,6 +150,7 @@ Fallback 例子：
 - active audio 至少 10 秒，但 substantive 字元少過 3 個。
 
 一般專有名詞、accuracy、標點或分段質素問題唔會自動 fallback。每個 attempt 嘅 raw text、raw segments、model snapshot、quality report、錯誤同 runtime 都保留喺同一 transcript JSON，唔會融合或覆蓋。
+明確 `--asr vibevoice` 只執行 VibeVoice；失敗會寫出 diagnostic JSON，絕不靜默改用 Qwen3 或 SenseVoice。
 
 ## Output contract
 
@@ -156,7 +170,10 @@ output/
 └── meeting.srt
 ```
 
-Qwen3 原生 model timestamps 會標記為 `timing_source: "model"`。SenseVoiceSmall 冇 word-level timestamps，本程式會先保留 30 秒 chunk timing，再按文字長度建立 cue；JSON 會標記 `timing_source: "estimated_from_chunk"` 並加入 warning。
+Qwen3 同 VibeVoice 原生 model timestamps 會標記為 `timing_source: "model"`。VibeVoice 嘅
+speaker id 同 raw structured output 只保留喺 attempt metadata，唔會改 canonical schema。
+SenseVoiceSmall 冇 word-level timestamps，本程式會先保留 30 秒 chunk timing，再按文字長度建立 cue；
+JSON 會標記 `timing_source: "estimated_from_chunk"` 並加入 warning。
 
 如所有 attempts 都失敗，`extract` 仍會原子寫出 `status: "failed"` 嘅 diagnostic JSON，再以非零 exit code 停止。`export` 拒絕處理 failed JSON。
 
@@ -190,7 +207,7 @@ uv run python -m compileall -q src tests
 bash -n setup.sh scripts/*.sh
 ```
 
-Backend-independent tests 用 fake services 驗證 fallback、attempt preservation、schema、post-processing、export、media command 同 CLI contract。真正 MLX inference 同 model download 必須喺 Apple Silicon Mac 完成 smoke test。
+Backend-independent tests 用 fake services 驗證 fallback、attempt preservation、schema、post-processing、export、media command、VibeVoice native adapter 同 CLI contract。真正 ASR inference、model download 同 VibeVoice MPS/offline smoke test 必須喺 Apple Silicon Mac 完成。
 
 ## 文件
 
@@ -198,3 +215,4 @@ Backend-independent tests 用 fake services 驗證 fallback、attempt preservati
 - [ARCHITECTURE.md](ARCHITECTURE.md)：module boundary、offline routing、資料生命週期。
 - [SKILL.md](SKILL.md)：俾 Codex／agent 執行呢個工具時遵守嘅操作規則。
 - [mlx-qwen3-asr](https://github.com/moona3k/mlx-qwen3-asr/)／[MLX-Audio](https://github.com/Blaizzy/mlx-audio)／[SenseVoiceSmall](https://huggingface.co/mlx-community/SenseVoiceSmall)：upstream runtime/model documentation。
+- [Transformers VibeVoice ASR](https://huggingface.co/docs/transformers/main/en/model_doc/vibevoice_asr)／[VibeVoice-ASR-HF](https://huggingface.co/microsoft/VibeVoice-ASR-HF)：native processor/model documentation。

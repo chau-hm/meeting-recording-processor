@@ -87,7 +87,7 @@
       "required": ["attempt_id", "backend", "model", "status"],
       "properties": {
         "attempt_id": {"type": "string", "minLength": 1},
-        "backend": {"enum": ["qwen3", "sensevoice"]},
+        "backend": {"enum": ["qwen3", "sensevoice", "vibevoice"]},
         "model": {"type": "string", "minLength": 1},
         "model_snapshot": {"type": ["string", "null"]},
         "status": {"enum": ["completed", "hard_failure", "error"]},

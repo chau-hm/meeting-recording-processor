@@ -21,8 +21,11 @@ def normalize_audio(
     metadata: MediaMetadata,
     destination: Path,
     *,
+    target_sample_rate: int = TARGET_SAMPLE_RATE,
     runner: Runner = subprocess.run,
 ) -> Path:
+    if target_sample_rate <= 0:
+        raise MediaError(f"音訊 sample rate 無效：{target_sample_rate}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     command = [
         "ffmpeg",
@@ -38,7 +41,7 @@ def normalize_audio(
         "-ac",
         str(TARGET_CHANNELS),
         "-ar",
-        str(TARGET_SAMPLE_RATE),
+        str(target_sample_rate),
         "-c:a",
         TARGET_CODEC,
         "-y",

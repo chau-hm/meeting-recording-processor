@@ -13,7 +13,7 @@ description: Locally extract Cantonese-heavy meeting audio or video to a canonic
 
 1. 只接受 `.m4a`、`.mp3`、`.wav`、`.flac`、`.mp4`、`.mov` regular file。
 2. 必須係 macOS Apple Silicon arm64，並已安裝 `uv`、`ffmpeg`、`ffprobe`。
-3. 先執行 `uv run mrp doctor`。缺少 model 時，向使用者說明並明確執行 `uv run mrp download-model --asr all`；下載係唯一可連網步驟。
+3. 先執行 `uv run mrp doctor`。缺少 model 時，向使用者說明並明確執行 `uv run mrp download-model --asr all`；下載係唯一可連網步驟。VibeVoice 係大型 model，並要求 Apple Silicon MPS。
 4. 唔可以 upload media、transcript 或 context，亦唔可以改用 cloud ASR。
 
 ## Step 1 — Extract
@@ -25,6 +25,7 @@ uv run mrp extract <input> --asr auto
 ```
 
 必要時可以加入 `--context-file`、`--output-dir`、`--work-dir`、`--cache-dir` 或 `--progress auto|on|off`。亦可以用 `ASR_PROGRESS=auto|on|off` 控制進度輸出。預設 `auto` 先 Qwen3，只喺客觀 hard failure fallback SenseVoice：backend exception、空白、Unicode 標點／符號比例超過 90%，或至少 10 秒 active audio 但少過 3 個 substantive 字元。
+如要明確評估 VibeVoice，使用 `uv run mrp extract <input> --asr vibevoice`。VibeVoice 輸入係 24 kHz、最多單次 60 分鐘；speaker/timestamp structured output 會保留喺 attempt metadata，但 canonical schema 暫時唔啟用 diarization。
 
 一般專有名詞、accuracy、punctuation 或 segmentation 問題唔可以觸發自動 fallback。使用者如要求人工重試，另行執行 `--asr sensevoice` 並使用另一 output directory，避免覆蓋第一次 JSON。
 
@@ -69,7 +70,7 @@ uv run mrp export <input-stem>.transcript.json
 
 ## Failure handling
 
-- 指定 `--asr qwen3` 或 `--asr sensevoice` 時，唔可以靜默換 backend。
+- 指定 `--asr qwen3`、`--asr sensevoice` 或 `--asr vibevoice` 時，唔可以靜默換 backend；VibeVoice 失敗時唔會 fallback 到其他 backend。
 - 所有 attempt 失敗時，保留 `status: failed` diagnostic JSON，報告非零狀態並停止。
 - output 已存在時，預設拒絕覆蓋。只喺使用者明確授權取代該精確檔案先用 `--overwrite`。
 - 唔刪 input。Work cleanup 只可由程式清理本次 run 建立嘅 scoped directory。
@@ -82,6 +83,6 @@ uv run mrp export <input-stem>.transcript.json
 
 ## Out of scope
 
-Speaker diarization、video OCR/frame analysis、Whisper、cloud ASR、live captions、自動 transcript cleanup、meeting notes、summary、action-item extraction。
+Canonical speaker diarization promotion、video OCR/frame analysis、Whisper、cloud ASR、live captions、自動 transcript cleanup、meeting notes、summary、action-item extraction。
 
 詳細 contract：`SPEC.md`。Implementation/data flow：`ARCHITECTURE.md`。Machine-readable schema：`schemas/transcript-v1.schema.json`。

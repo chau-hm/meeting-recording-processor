@@ -8,7 +8,8 @@ import shutil
 from time import perf_counter
 from typing import Any, Callable
 
-from .asr import Qwen3Backend, SenseVoiceBackend
+from .asr import Qwen3Backend, SenseVoiceBackend, VibeVoiceBackend
+from .asr.vibevoice import TARGET_SAMPLE_RATE as VIBEVOICE_SAMPLE_RATE
 from .config import AsrMode, ExtractConfig, SUPPORTED_EXTENSIONS
 from .errors import ConfigurationError, OutputExistsError, TranscriptionFailed
 from .manifest import new_run_id, sha256_file, tool_metadata, utc_now_iso
@@ -48,6 +49,8 @@ def default_backend_factory(
         return Qwen3Backend(model_id=model_id, model_path=model_path, verbose=verbose)
     if backend == AsrMode.SENSEVOICE.value:
         return SenseVoiceBackend(model_id=model_id, model_path=model_path, verbose=verbose)
+    if backend == AsrMode.VIBEVOICE.value:
+        return VibeVoiceBackend(model_id=model_id, model_path=model_path, verbose=verbose)
     raise ConfigurationError(f"未知 ASR backend：{backend}")
 
 
@@ -60,7 +63,7 @@ class Extractor:
         platform_validator: Callable[[], None] = require_apple_silicon,
         media_commands_validator: Callable[[], None] = require_media_commands,
         probe: Callable[[Path], MediaMetadata] = probe_media,
-        normalizer: Callable[[Path, MediaMetadata, Path], Path] = normalize_audio,
+        normalizer: Callable[..., Path] = normalize_audio,
         signal_analyzer: Callable[[Path], AudioSignalStats] = analyze_wav_signal,
         model_resolver: ModelResolver = resolve_cached_model,
         backend_factory: BackendFactory = default_backend_factory,
@@ -104,7 +107,12 @@ class Extractor:
             run_id = new_run_id()
             work_path = work_root / f"{input_path.stem}-{run_id}"
             work_path.mkdir(parents=True, exist_ok=False)
-            normalized_path = work_path / "audio-16k-mono.wav"
+            target_sample_rate = (
+                VIBEVOICE_SAMPLE_RATE
+                if config.asr_mode is AsrMode.VIBEVOICE
+                else 16_000
+            )
+            normalized_path = work_path / f"audio-{target_sample_rate // 1000}k-mono.wav"
 
             attempts: list[AttemptRecord] = []
             selected_result: BackendResult | None = None
@@ -112,7 +120,15 @@ class Extractor:
             pipeline_error: str | None = None
             all_warnings: list[str] = []
 
-            self.normalizer(input_path, media, normalized_path)
+            if target_sample_rate == 16_000:
+                self.normalizer(input_path, media, normalized_path)
+            else:
+                self.normalizer(
+                    input_path,
+                    media,
+                    normalized_path,
+                    target_sample_rate=target_sample_rate,
+                )
             signal = self.signal_analyzer(normalized_path)
             duration = media.duration_seconds
             if duration is None and signal.duration_seconds > 0:
@@ -327,6 +343,8 @@ class Extractor:
             return config.qwen_model
         if backend == AsrMode.SENSEVOICE.value:
             return config.sensevoice_model
+        if backend == AsrMode.VIBEVOICE.value:
+            return config.vibevoice_model
         raise ConfigurationError(f"未知 backend：{backend}")
 
     def _build_package(
@@ -368,6 +386,7 @@ class Extractor:
                 "models": {
                     "qwen3": config.qwen_model,
                     "sensevoice": config.sensevoice_model,
+                    "vibevoice": config.vibevoice_model,
                 },
                 "offline": True,
             },
@@ -375,7 +394,11 @@ class Extractor:
             "selected_attempt_id": selected_attempt_id,
             "transcript": transcript,
             "processing": {
-                "audio": "16 kHz mono PCM WAV",
+                "audio": (
+                    "24 kHz mono PCM WAV"
+                    if config.asr_mode is AsrMode.VIBEVOICE
+                    else "16 kHz mono PCM WAV"
+                ),
                 "steps": [
                     "Unicode NFC",
                     "whitespace/control-character cleanup",
