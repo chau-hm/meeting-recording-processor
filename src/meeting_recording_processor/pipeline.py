@@ -17,6 +17,7 @@ from .media.probe import MediaMetadata, ffprobe_version, probe_media
 from .media.signal import AudioSignalStats, analyze_wav_signal
 from .models import ResolvedModel, resolve_cached_model
 from .postprocess import postprocess_result
+from .progress import ProgressPhase, ProgressReporter, format_duration
 from .quality import inspect_text
 from .runtime import require_apple_silicon, require_media_commands
 from .schema_io import SCHEMA_VERSION, write_package
@@ -33,6 +34,11 @@ class ExtractResult:
 
 BackendFactory = Callable[[str, str, Path, bool], Any]
 ModelResolver = Callable[[str, Path], ResolvedModel]
+ProgressFactory = Callable[[ExtractConfig], ProgressReporter]
+
+
+def default_progress_factory(config: ExtractConfig) -> ProgressReporter:
+    return ProgressReporter(mode=config.progress_mode)
 
 
 def default_backend_factory(
@@ -61,6 +67,7 @@ class Extractor:
         postprocessor: Callable[..., tuple[str, tuple, tuple]] = postprocess_result,
         file_hasher: Callable[[Path], str] = sha256_file,
         probe_version: Callable[[], str | None] = ffprobe_version,
+        progress_factory: ProgressFactory = default_progress_factory,
     ) -> None:
         self.platform_validator = platform_validator
         self.media_commands_validator = media_commands_validator
@@ -72,6 +79,7 @@ class Extractor:
         self.postprocessor = postprocessor
         self.file_hasher = file_hasher
         self.probe_version = probe_version
+        self.progress_factory = progress_factory
 
     def extract(self, config: ExtractConfig) -> ExtractResult:
         input_path = config.input_path.expanduser().resolve()
@@ -81,24 +89,44 @@ class Extractor:
         context_file = config.context_file.expanduser().resolve() if config.context_file else None
 
         self._validate_request(input_path, output_path, context_file, config.overwrite)
-        self.platform_validator()
-        self.media_commands_validator()
-
-        media = self.probe(input_path)
-        run_id = new_run_id()
-        work_path = work_root / f"{input_path.stem}-{run_id}"
-        work_path.mkdir(parents=True, exist_ok=False)
-        normalized_path = work_path / "audio-16k-mono.wav"
-
-        attempts: list[AttemptRecord] = []
-        selected_result: BackendResult | None = None
-        selected_attempt_id: str | None = None
-        pipeline_error: str | None = None
-        all_warnings: list[str] = []
-
+        progress = self.progress_factory(config)
+        work_path: Path | None = None
         try:
+            progress.start(message=f"Preparing {input_path.name}...")
+            self.platform_validator()
+            self.media_commands_validator()
+
+            progress.emit_phase(
+                ProgressPhase.PREPARING,
+                message="Inspecting media...",
+            )
+            media = self.probe(input_path)
+            run_id = new_run_id()
+            work_path = work_root / f"{input_path.stem}-{run_id}"
+            work_path.mkdir(parents=True, exist_ok=False)
+            normalized_path = work_path / "audio-16k-mono.wav"
+
+            attempts: list[AttemptRecord] = []
+            selected_result: BackendResult | None = None
+            selected_attempt_id: str | None = None
+            pipeline_error: str | None = None
+            all_warnings: list[str] = []
+
             self.normalizer(input_path, media, normalized_path)
             signal = self.signal_analyzer(normalized_path)
+            duration = media.duration_seconds
+            if duration is None and signal.duration_seconds > 0:
+                duration = signal.duration_seconds
+            progress.emit_phase(
+                ProgressPhase.PREPARING,
+                current=0.0,
+                total=duration,
+                message=(
+                    f"Audio ready; duration {format_duration(duration)}."
+                    if duration is not None
+                    else "Audio ready; duration unknown."
+                ),
+            )
             profile_text = self._read_context(context_file)
             sequence = self._backend_sequence(config.asr_mode)
 
@@ -111,6 +139,11 @@ class Extractor:
                 backend_result: BackendResult | None = None
                 error: str | None = None
                 try:
+                    if index == 1:
+                        progress.emit_phase(
+                            ProgressPhase.LOADING_MODEL,
+                            message=f"Loading {backend_name} model...",
+                        )
                     resolved = self.model_resolver(model_id, cache_dir)
                     backend = self.backend_factory(
                         backend_name, model_id, resolved.path, config.verbose
@@ -119,6 +152,7 @@ class Extractor:
                         normalized_path,
                         language=config.language,
                         profile_text=profile_text,
+                        progress_callback=progress.emit if progress.enabled else None,
                     )
                     quality_report = inspect_text(
                         backend_result.text,
@@ -162,6 +196,19 @@ class Extractor:
                     break
                 if config.asr_mode is not AsrMode.AUTO:
                     break
+                if index < len(sequence):
+                    fallback_reason = (
+                        "failed objective quality gate"
+                        if backend_result is not None
+                        else "failed"
+                    )
+                    progress.emit_phase(
+                        ProgressPhase.FALLBACK,
+                        message=(
+                            f"{backend_name} {fallback_reason}; "
+                            f"falling back to {sequence[index]} and loading model..."
+                        ),
+                    )
 
             transcript_payload: dict[str, Any] | None = None
             if selected_result is not None:
@@ -187,6 +234,10 @@ class Extractor:
                 pipeline_error = "all_asr_attempts_failed"
 
             status = "completed" if selected_result is not None else "failed"
+            progress.emit_phase(
+                ProgressPhase.WRITING_OUTPUT,
+                message="Writing transcript files...",
+            )
             package = self._build_package(
                 status=status,
                 run_id=run_id,
@@ -206,10 +257,20 @@ class Extractor:
             write_package(output_path, package, overwrite=config.overwrite)
 
             if status != "completed":
+                failure_detail = pipeline_error or next(
+                    (
+                        attempt.error
+                        for attempt in reversed(attempts)
+                        if attempt.error
+                    ),
+                    "all ASR attempts failed",
+                )
+                progress.fail(failure_detail)
                 raise TranscriptionFailed(
                     "所有可用 ASR attempt 都未能產生有效 transcript",
                     diagnostic_path=output_path,
                 )
+            progress.complete()
             return ExtractResult(
                 output_path=output_path,
                 selected_backend=selected_result.backend,
@@ -219,8 +280,15 @@ class Extractor:
                 ),
                 warnings=tuple(dict.fromkeys(all_warnings)),
             )
+        except KeyboardInterrupt:
+            progress.fail("Interrupted")
+            raise
+        except Exception as exc:
+            if not progress.finished:
+                progress.fail(str(exc))
+            raise
         finally:
-            if not config.keep_work_files and work_path.exists():
+            if not config.keep_work_files and work_path is not None and work_path.exists():
                 shutil.rmtree(work_path)
 
     @staticmethod

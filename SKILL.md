@@ -11,7 +11,7 @@ description: Locally extract Cantonese-heavy meeting audio or video to a canonic
 
 ## Preconditions
 
-1. 只接受 `.m4a`、`.mp3`、`.wav`、`.mp4`、`.mov` regular file。
+1. 只接受 `.m4a`、`.mp3`、`.wav`、`.flac`、`.mp4`、`.mov` regular file。
 2. 必須係 macOS Apple Silicon arm64，並已安裝 `uv`、`ffmpeg`、`ffprobe`。
 3. 先執行 `uv run mrp doctor`。缺少 model 時，向使用者說明並明確執行 `uv run mrp download-model --asr all`；下載係唯一可連網步驟。
 4. 唔可以 upload media、transcript 或 context，亦唔可以改用 cloud ASR。
@@ -24,9 +24,11 @@ description: Locally extract Cantonese-heavy meeting audio or video to a canonic
 uv run mrp extract <input> --asr auto
 ```
 
-必要時可以加入 `--context-file`、`--output-dir`、`--work-dir` 或 `--cache-dir`。預設 `auto` 先 Qwen3，只喺客觀 hard failure fallback SenseVoice：backend exception、空白、Unicode 標點／符號比例超過 90%，或至少 10 秒 active audio 但少過 3 個 substantive 字元。
+必要時可以加入 `--context-file`、`--output-dir`、`--work-dir`、`--cache-dir` 或 `--progress auto|on|off`。亦可以用 `ASR_PROGRESS=auto|on|off` 控制進度輸出。預設 `auto` 先 Qwen3，只喺客觀 hard failure fallback SenseVoice：backend exception、空白、Unicode 標點／符號比例超過 90%，或至少 10 秒 active audio 但少過 3 個 substantive 字元。
 
 一般專有名詞、accuracy、punctuation 或 segmentation 問題唔可以觸發自動 fallback。使用者如要求人工重試，另行執行 `--asr sensevoice` 並使用另一 output directory，避免覆蓋第一次 JSON。
+
+如果 `auto` 因客觀 hard failure fallback，進度會先顯示 `fallback` transition 同下一個 model loading，之後由新 backend 重新顯示自己嘅 `transcribing` progress；唔會將 model loading 假裝成 transcription，亦唔會沿用上一個 backend 嘅 percentage。
 
 Extract 成功只會產生：
 
@@ -42,6 +44,16 @@ Extract 成功只會產生：
 本機轉錄已完成並寫出 transcript JSON。
 流程已停喺 extract；未有 export、整理逐字稿或生成會議記錄。
 ```
+
+### Batch（只係逐一重用 extract）
+
+如要處理一個 directory，執行：
+
+```bash
+uv run mrp batch <input-directory> --asr auto
+```
+
+Batch 會按檔名排序，逐一產生 `<input-stem>.transcript.json`，並喺進度輸出顯示 `File N of M`。開始第一個 transcription 前，程式會先計算全部 destinations；同 stem 或 macOS case-insensitive 等價 destination 嘅 input 會 fail closed。`--overwrite` 只授權取代已存在嘅精確 destination，唔會放寬同一 batch 內嘅 collision。
 
 ## Step 2 — Export（只在明確要求時）
 

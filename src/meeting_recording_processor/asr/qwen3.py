@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..errors import BackendError
+from ..progress import ProgressEvent, ProgressPhase
 from ..schemas import BackendResult, TranscriptSegment
+from .base import ProgressCallback, isolate_progress_callback
 
 BACKEND_NAME = "qwen3"
 DEFAULT_MODEL_ID = "Qwen/Qwen3-ASR-1.7B"
@@ -40,6 +43,79 @@ def _segments_from_result(items: object, *, timing_source: str) -> tuple[Transcr
     return tuple(segments)
 
 
+def _optional_number(value: object) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 and math.isfinite(number) else None
+
+
+def _progress_event(payload: object) -> ProgressEvent | None:
+    if not isinstance(payload, dict):
+        return None
+
+    event_name = str(payload.get("event", ""))
+    if event_name not in {
+        "chunks_prepared",
+        "chunk_started",
+        "chunk_completed",
+        "completed",
+    }:
+        return None
+
+    processed = _optional_number(payload.get("processed_audio_sec"))
+    total = _optional_number(payload.get("audio_duration_sec"))
+    current = processed
+    unit = "seconds"
+    if event_name == "chunks_prepared" and current is None and total is not None:
+        current = 0.0
+    if current is None or total is None or total <= 0:
+        current = _optional_number(payload.get("chunk_index"))
+        total = _optional_number(payload.get("total_chunks"))
+        unit = "chunks"
+
+    chunk_index = payload.get("chunk_index")
+    total_chunks = payload.get("total_chunks")
+    if event_name == "chunks_prepared":
+        message = "Transcribing..."
+    elif chunk_index is not None and total_chunks is not None:
+        message = f"Transcribing chunk {chunk_index}/{total_chunks}..."
+    else:
+        message = "Transcribing..."
+    return ProgressEvent(
+        phase=ProgressPhase.TRANSCRIBING,
+        current=current,
+        total=total,
+        unit=unit,
+        message=message,
+        determinate=current is not None and total is not None and total > 0,
+    )
+
+
+def _safe_progress_callback(
+    progress_callback: ProgressCallback | None,
+) -> Callable[[dict[str, Any]], None] | None:
+    isolated = isolate_progress_callback(progress_callback)
+    if isolated is None:
+        return None
+
+    enabled = True
+
+    def on_progress(payload: dict[str, Any]) -> None:
+        nonlocal enabled
+        if not enabled:
+            return
+        try:
+            event = _progress_event(payload)
+            if event is not None:
+                isolated(event)
+        except Exception:
+            enabled = False
+
+    return on_progress
+
+
 class Qwen3Backend:
     name = BACKEND_NAME
 
@@ -54,7 +130,9 @@ class Qwen3Backend:
         *,
         language: str,
         profile_text: str | None,
+        progress_callback: ProgressCallback | None = None,
     ) -> BackendResult:
+        on_progress = _safe_progress_callback(progress_callback)
         try:
             from mlx_qwen3_asr import transcribe
 
@@ -66,6 +144,7 @@ class Qwen3Backend:
                 return_timestamps=True,
                 return_chunks=True,
                 verbose=self.verbose,
+                on_progress=on_progress,
             )
         except Exception as exc:
             raise BackendError(f"Qwen3-ASR 執行失敗：{exc}") from exc

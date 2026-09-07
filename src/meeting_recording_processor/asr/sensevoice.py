@@ -8,7 +8,9 @@ from typing import Any
 import wave
 
 from ..errors import BackendError, MediaError
+from ..progress import ProgressEvent, ProgressPhase
 from ..schemas import BackendResult, TranscriptSegment
+from .base import ProgressCallback, isolate_progress_callback
 
 BACKEND_NAME = "sensevoice"
 DEFAULT_MODEL_ID = "mlx-community/SenseVoiceSmall"
@@ -78,6 +80,7 @@ class SenseVoiceBackend:
         *,
         language: str,
         profile_text: str | None,
+        progress_callback: ProgressCallback | None = None,
     ) -> BackendResult:
         try:
             from mlx_audio.stt import load
@@ -91,6 +94,7 @@ class SenseVoiceBackend:
             raise BackendError(f"SenseVoice 唔支援 language value：{language}")
 
         warnings: list[str] = []
+        report_progress = isolate_progress_callback(progress_callback)
         if profile_text:
             warnings.append("SenseVoice adapter 不支援 context hotwords；已保留設定但冇注入 model")
 
@@ -109,6 +113,17 @@ class SenseVoiceBackend:
             if source.getnchannels() != 1 or source.getsampwidth() != 2:
                 raise MediaError("SenseVoice input 必須係 16-bit mono WAV")
             frames_per_chunk = max(1, int(sample_rate * self.chunk_seconds))
+            total_duration = source.getnframes() / sample_rate if sample_rate else None
+            if report_progress is not None:
+                report_progress(
+                    ProgressEvent(
+                        phase=ProgressPhase.TRANSCRIBING,
+                        current=0.0,
+                        total=total_duration,
+                        unit="seconds",
+                        message="Transcribing...",
+                    )
+                )
             offset_frames = 0
             chunk_index = 0
             while True:
@@ -153,6 +168,16 @@ class SenseVoiceBackend:
                     )
                 offset_frames += written_frames
                 chunk_index += 1
+                if report_progress is not None:
+                    report_progress(
+                        ProgressEvent(
+                            phase=ProgressPhase.TRANSCRIBING,
+                            current=offset_frames / sample_rate,
+                            total=total_duration,
+                            unit="seconds",
+                            message=f"Transcribing chunk {chunk_index}...",
+                        )
+                    )
 
         detected_languages = [
             item["language"] for item in chunk_metadata if item.get("language")
