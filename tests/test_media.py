@@ -38,6 +38,20 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(metadata.duration_seconds, 12.5)
         self.assertEqual(metadata.audio_streams[0].language, "yue")
 
+    def test_probe_treats_invalid_duration_as_unknown(self) -> None:
+        payload = {
+            "format": {"format_name": "wav", "duration": "not-a-duration"},
+            "streams": [
+                {"index": 0, "codec_type": "audio", "codec_name": "pcm_s16le"}
+            ],
+        }
+
+        def runner(*_args, **_kwargs):
+            return subprocess.CompletedProcess([], 0, json.dumps(payload), "")
+
+        metadata = probe_media(Path("meeting.wav"), runner=runner)
+        self.assertIsNone(metadata.duration_seconds)
+
     def test_probe_rejects_media_without_audio(self) -> None:
         payload = {"format": {}, "streams": [{"index": 0, "codec_type": "video"}]}
 

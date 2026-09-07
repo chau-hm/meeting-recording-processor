@@ -11,7 +11,7 @@ Apple Silicon 上完全本機運行嘅廣東話會議轉錄工具。輸入錄音
 
 - macOS Apple Silicon arm64（M1/M2/M3/M4）
 - Python 3.11–3.13、`uv`、system `ffmpeg`／`ffprobe`
-- `.m4a`、`.mp3`、`.wav`、`.mp4`、`.mov`
+- `.m4a`、`.mp3`、`.wav`、`.flac`、`.mp4`、`.mov`
 - 影片只讀 audio stream；唔分析畫面、唔做 OCR
 - `qwen3`：`mlx-qwen3-asr==0.3.5` + `Qwen/Qwen3-ASR-1.7B`
 - `sensevoice`：`mlx-audio==0.4.1` + `mlx-community/SenseVoiceSmall`
@@ -56,6 +56,13 @@ Shell wrappers 提供同一功能：
 ./scripts/export.sh output/meeting.transcript.json
 ```
 
+批次轉錄會逐一處理目錄內嘅支援檔案：
+
+```bash
+./scripts/transcribe-batch.sh recordings/
+# 或：uv run mrp batch recordings/
+```
+
 常用選項：
 
 ```bash
@@ -75,6 +82,39 @@ uv run mrp cache-size
 ```
 
 預設 context 係 `profiles/generic.txt`。LOQ vocabulary 只係 opt-in example，核心程式冇 hard-code domain data。
+
+## 轉錄進度
+
+`extract` 同 `batch` 預設用 `ASR_PROGRESS=auto`：TTY 會更新單一進度行，redirect／CI output 會寫普通 log 行。亦可明確設定：
+
+```bash
+export ASR_PROGRESS=auto  # 預設；TTY compact display，非 TTY plain logs
+export ASR_PROGRESS=on    # 強制輸出（非 TTY 仍然唔會用 cursor escape）
+export ASR_PROGRESS=off   # 關閉進度輸出
+```
+
+等價嘅單次 command option 係 `--progress auto|on|off`。
+
+進度會顯示目前 phase、elapsed time，同可用嘅 media duration。Qwen3 透過 pinned runtime 嘅 structured `on_progress` callback，以實際已處理 audio seconds／總 duration 計算百分比；SenseVoice 以已完成 chunk 嘅實際 audio duration 報告。若 backend 沒有可靠 total，會顯示 `Transcribing...` 而唔會估算百分比。
+
+單檔 TTY output 例子：
+
+```text
+Preparing audio...
+Loading qwen3 model...
+Transcribing [#############-------] 68%  43:18 / 1:03:42  Elapsed: 18:27
+Writing transcript files...
+Completed in 27:11
+```
+
+batch output 例子：
+
+```text
+File 3 of 8: meeting-03.m4a
+Transcribing [##########----------] 51%  32:28 / 1:03:42  Elapsed: 14:02
+```
+
+非互動 output 會保留 phase、percentage（如有）、processed／total duration 同 elapsed，方便 redirect 到 log。
 
 ## `auto` fallback 規則
 
@@ -118,7 +158,7 @@ meeting-recording-processor/
 ├── src/meeting_recording_processor/   # CLI、pipeline、adapters、media、writers
 ├── tests/                             # 無需 MLX/model 嘅 unit + integration tests
 ├── schemas/                           # transcript JSON Schema
-├── scripts/                           # setup／extract／export wrappers + legacy baseline
+├── scripts/                           # setup／extract／export／batch wrappers + legacy baseline
 ├── profiles/                          # generic 同 opt-in vocabulary
 ├── README.md
 ├── SPEC.md

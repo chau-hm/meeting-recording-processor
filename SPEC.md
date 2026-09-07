@@ -11,7 +11,8 @@
 
 | Command | Input | Output | Stop condition |
 |---|---|---|---|
-| `extract` | `.m4a/.mp3/.wav/.mp4/.mov` | `<stem>.transcript.json` | 寫出 JSON 後停止 |
+| `extract` | `.m4a/.mp3/.wav/.flac/.mp4/.mov` | `<stem>.transcript.json` | 寫出 JSON 後停止 |
+| `batch` | 支援格式嘅 input directory | 每個 input 一個 `.transcript.json` | 所有檔案完成或記錄 failure 後停止 |
 | `export` | 成功嘅 `.transcript.json` | `<stem>.txt` + `<stem>.srt` | 寫出兩個格式後停止 |
 
 任何 command 都唔會自動產生 clean transcript、meeting notes、summary 或 action items。上述衍生內容只可由使用者另行要求，並唔屬於本工具 v1 pipeline。
@@ -22,12 +23,12 @@
 
 - 只支援 Darwin arm64；其他平台 fail closed 並顯示原因。
 - Python `>=3.11,<3.14`，以 `uv` 管理 environment。
-- 接受 `.m4a`、`.mp3`、`.wav`、`.mp4`、`.mov`；extension 比對不分大小寫。
+- 接受 `.m4a`、`.mp3`、`.wav`、`.flac`、`.mp4`、`.mov`；extension 比對不分大小寫。
 - 原始 input 永不修改或刪除。
 
 ### FR-02 Media handling
 
-- 以 `ffprobe` 讀 metadata 並選擇第一條 audio stream。
+- 以 `ffprobe` 讀 metadata、duration 並選擇第一條 audio stream；duration 缺失或無效時唔阻止 ASR，進度會退回 indeterminate。
 - 冇 audio stream 時失敗；影片 frame 永遠唔會傳入 ASR。
 - 以明確 stream map 將 audio normalize 成 16 kHz、mono、16-bit PCM WAV。
 - 記錄 container、duration、stream、signal stats、ffprobe version。
@@ -75,6 +76,14 @@ Qwen3 attempt 符合任一條件時，`auto` 先執行 SenseVoice：
 - 完全冇 timestamp 時，按 audio duration 同文字長度估算，並加入 warning。
 - SRT 只由 canonical segments 產生，唔聲稱 estimated timing 係 word-level timestamp。
 
+### FR-07a Progress
+
+- Progress events 使用 backend-neutral `phase/current/total/unit/elapsed/message/determinate` contract。
+- Qwen3 以 runtime structured progress callback 嘅 processed audio seconds／total duration 報告實際 transcription progress；無可靠 total 時唔顯示百分比。
+- TTY 使用 compact updating display；非 TTY 只輸出 plain log lines，唔包含 cursor-control escape sequences。
+- `ASR_PROGRESS=auto|on|off` 控制 progress output，亦可用 `--progress`；預設係 `auto`。
+- `batch` 顯示 current file index、total files、filename，同 current file 嘅 progress；唔以檔案數量冒充 duration-weighted aggregate。
+
 ### FR-08 Output and collision safety
 
 `extract` 只寫一個 JSON：
@@ -116,6 +125,10 @@ mrp extract INPUT
   [--keep-work-files]
   [--overwrite]
   [--verbose]
+  [--progress auto|on|off]
+
+mrp batch INPUT_DIRECTORY
+  [same ASR, path, overwrite, verbose and progress options as extract]
 
 mrp export TRANSCRIPT_JSON
   [--output-dir PATH]
@@ -179,10 +192,11 @@ Normative machine-readable schema：`schemas/transcript-v1.schema.json`。
 - [x] 香港繁體 deterministic post-processing，無內容改寫。
 - [x] JSON → TXT/SRT export；failed JSON fail closed。
 - [x] unit/integration tests 無需真 model。
+- [x] TTY/plain progress、indeterminate fallback、batch file reporting 同 failure cleanup。
 - [x] shell wrappers、baseline preservation、完整文件同 JSON Schema。
-- [ ] Apple Silicon 實機下載兩個 models 並完成真實 M4A/MP3/WAV/MP4/MOV smoke test。
+- [ ] Apple Silicon 實機下載兩個 models 並完成真實 M4A/MP3/WAV/FLAC/MP4/MOV smoke test。
 - [ ] Apple Silicon 上產生／驗證 `uv.lock` 同量度 cache/runtime disk usage。
 
 ## 7. Deferred／out of scope
 
-Speaker diarization、batch command、live captions、Whisper、cloud ASR、video OCR/frame analysis、automatic transcript cleanup、meeting-note/action-item generation。任何新增功能必須另行更新 privacy、schema 同 acceptance contract。
+Speaker diarization、live captions、Whisper、cloud ASR、video OCR/frame analysis、automatic transcript cleanup、meeting-note/action-item generation。任何新增功能必須另行更新 privacy、schema 同 acceptance contract。

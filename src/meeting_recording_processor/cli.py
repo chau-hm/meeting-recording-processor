@@ -13,14 +13,41 @@ from .config import (
     DEFAULT_SENSEVOICE_MODEL,
     ExportConfig,
     ExtractConfig,
+    SUPPORTED_EXTENSIONS,
     project_root,
 )
 from .diagnostics import doctor_report
-from .errors import ProcessorError, TranscriptionFailed
+from .errors import ConfigurationError, ProcessorError, TranscriptionFailed
 from .models import directory_size, download_model, human_size
 from .outputs import export_transcript
 from .pipeline import extract
+from .progress import ProgressMode, resolve_progress_mode
 from .runtime import require_apple_silicon
+
+
+def _add_transcription_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--asr",
+        choices=[mode.value for mode in AsrMode],
+        default=AsrMode.AUTO.value,
+        help="auto 先用 Qwen3，只有客觀 hard failure 先 fallback SenseVoice",
+    )
+    parser.add_argument("--language", default="Cantonese")
+    parser.add_argument("--context-file", type=Path)
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--work-dir", type=Path)
+    parser.add_argument("--cache-dir", type=Path)
+    parser.add_argument("--qwen-model", default=DEFAULT_QWEN_MODEL)
+    parser.add_argument("--sensevoice-model", default=DEFAULT_SENSEVOICE_MODEL)
+    parser.add_argument("--keep-work-files", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--progress",
+        dest="progress_mode",
+        choices=[mode.value for mode in ProgressMode],
+        help="進度輸出：auto（預設）、on 或 off；亦可用 ASR_PROGRESS",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -33,23 +60,16 @@ def build_parser() -> argparse.ArgumentParser:
     extract_parser = subparsers.add_parser(
         "extract", help="由 audio／video 抽取並轉錄成 .transcript.json"
     )
-    extract_parser.add_argument("input", type=Path, help="輸入 .m4a/.mp3/.wav/.mp4/.mov")
     extract_parser.add_argument(
-        "--asr",
-        choices=[mode.value for mode in AsrMode],
-        default=AsrMode.AUTO.value,
-        help="auto 先用 Qwen3，只有客觀 hard failure 先 fallback SenseVoice",
+        "input", type=Path, help="輸入 .m4a/.mp3/.wav/.flac/.mp4/.mov"
     )
-    extract_parser.add_argument("--language", default="Cantonese")
-    extract_parser.add_argument("--context-file", type=Path)
-    extract_parser.add_argument("--output-dir", type=Path)
-    extract_parser.add_argument("--work-dir", type=Path)
-    extract_parser.add_argument("--cache-dir", type=Path)
-    extract_parser.add_argument("--qwen-model", default=DEFAULT_QWEN_MODEL)
-    extract_parser.add_argument("--sensevoice-model", default=DEFAULT_SENSEVOICE_MODEL)
-    extract_parser.add_argument("--keep-work-files", action="store_true")
-    extract_parser.add_argument("--overwrite", action="store_true")
-    extract_parser.add_argument("--verbose", action="store_true")
+    _add_transcription_options(extract_parser)
+
+    batch_parser = subparsers.add_parser(
+        "batch", help="逐一轉錄目錄內支援嘅 audio／video 檔案"
+    )
+    batch_parser.add_argument("input", type=Path, help="輸入目錄")
+    _add_transcription_options(batch_parser)
 
     export_parser = subparsers.add_parser(
         "export", help="由 .transcript.json 產生 .txt 同 .srt"
@@ -103,6 +123,7 @@ def _run_extract(args: argparse.Namespace) -> int:
             keep_work_files=args.keep_work_files,
             overwrite=args.overwrite,
             verbose=args.verbose,
+            progress_mode=args.progress_mode,
         )
     )
     print(f"本機轉錄已完成：{result.output_path}")
@@ -112,6 +133,69 @@ def _run_extract(args: argparse.Namespace) -> int:
     for warning in result.warnings:
         print(f"注意：{warning}")
     print("流程已停喺 extract；未有自動 export、cleanup 或生成會議記錄。")
+    return 0
+
+
+def _run_batch(args: argparse.Namespace) -> int:
+    input_dir = args.input.expanduser().resolve()
+    if not input_dir.is_dir():
+        raise ConfigurationError(f"搵唔到 input directory：{input_dir}")
+    try:
+        files = sorted(
+            (
+                path
+                for path in input_dir.iterdir()
+                if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
+            ),
+            key=lambda path: path.name.casefold(),
+        )
+    except OSError as exc:
+        raise ConfigurationError(f"無法讀取 input directory：{exc}") from exc
+    if not files:
+        supported = ", ".join(sorted(SUPPORTED_EXTENSIONS))
+        raise ConfigurationError(f"目錄內搵唔到支援檔案（{supported}）：{input_dir}")
+
+    output_dir, work_dir, cache_dir, context_file = _paths(args)
+    show_progress = resolve_progress_mode(args.progress_mode) is not ProgressMode.OFF
+    failures = 0
+    for index, input_path in enumerate(files, start=1):
+        if show_progress:
+            print(f"File {index} of {len(files)}: {input_path.name}", file=sys.stderr)
+        try:
+            result = extract(
+                ExtractConfig(
+                    input_path=input_path,
+                    output_dir=output_dir,
+                    work_dir=work_dir,
+                    cache_dir=cache_dir,
+                    asr_mode=AsrMode(args.asr),
+                    language=args.language,
+                    context_file=context_file,
+                    qwen_model=args.qwen_model,
+                    sensevoice_model=args.sensevoice_model,
+                    keep_work_files=args.keep_work_files,
+                    overwrite=args.overwrite,
+                    verbose=args.verbose,
+                    progress_mode=args.progress_mode,
+                )
+            )
+        except TranscriptionFailed as exc:
+            failures += 1
+            print(f"錯誤：{exc}", file=sys.stderr)
+            if exc.diagnostic_path:
+                print(f"診斷 JSON：{exc.diagnostic_path}", file=sys.stderr)
+            continue
+        except ProcessorError as exc:
+            failures += 1
+            print(f"錯誤：{exc}", file=sys.stderr)
+            continue
+        if show_progress:
+            print(f"Completed: {result.output_path}", file=sys.stderr)
+
+    if failures:
+        print(f"Batch transcription failed for {failures} of {len(files)} file(s).", file=sys.stderr)
+        return 1
+    print(f"Batch transcription completed: {len(files)} file(s).")
     return 0
 
 
@@ -176,6 +260,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "extract":
             return _run_extract(args)
+        if args.command == "batch":
+            return _run_batch(args)
         if args.command == "export":
             return _run_export(args)
         if args.command == "doctor":

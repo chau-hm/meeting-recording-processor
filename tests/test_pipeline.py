@@ -1,4 +1,5 @@
 from pathlib import Path
+from io import StringIO
 import tempfile
 import unittest
 
@@ -9,6 +10,7 @@ from meeting_recording_processor.media.signal import AudioSignalStats
 from meeting_recording_processor.models import ResolvedModel
 from meeting_recording_processor.pipeline import Extractor
 from meeting_recording_processor.postprocess import postprocess_result
+from meeting_recording_processor.progress import ProgressReporter
 from meeting_recording_processor.schema_io import load_package
 from meeting_recording_processor.schemas import BackendResult, TranscriptSegment
 
@@ -45,9 +47,18 @@ class PipelineTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def extractor(self, backends: dict[str, FakeBackend]) -> Extractor:
+    def extractor(
+        self,
+        backends: dict[str, FakeBackend],
+        *,
+        media_duration: float | None = 5.0,
+        progress_factory=None,
+    ) -> Extractor:
         metadata = MediaMetadata(
-            "mov,mp4,m4a", 5.0, (AudioStream(0, "aac", 1, 16000, "yue", True),), 0
+            "mov,mp4,m4a",
+            media_duration,
+            (AudioStream(0, "aac", 1, 16000, "yue", True),),
+            0,
         )
         signal = AudioSignalStats(5.0, 0.2, 0.5, 5.0, 1.0, 0.01)
 
@@ -61,7 +72,7 @@ class PipelineTests(unittest.TestCase):
         def factory(name, _model_id, _model_path, _verbose):
             return backends[name]
 
-        return Extractor(
+        extractor = Extractor(
             platform_validator=lambda: None,
             media_commands_validator=lambda: None,
             probe=lambda _path: metadata,
@@ -74,6 +85,9 @@ class PipelineTests(unittest.TestCase):
             ),
             probe_version=lambda: "ffprobe test",
         )
+        if progress_factory is not None:
+            extractor.progress_factory = progress_factory
+        return extractor
 
     def config(self, mode: AsrMode = AsrMode.AUTO) -> ExtractConfig:
         return ExtractConfig(
@@ -132,6 +146,27 @@ class PipelineTests(unittest.TestCase):
         package = load_package(extracted.output_path, require_completed=True)
         self.assertEqual(package["attempts"][0]["status"], "error")
         self.assertIn("model crash", package["attempts"][0]["error"])
+
+    def test_unknown_media_duration_does_not_abort_asr(self) -> None:
+        qwen = FakeBackend(result("qwen3", "我哋今日開始開會。"))
+        extracted = self.extractor(
+            {"qwen3": qwen, "sensevoice": FakeBackend(result("sensevoice", "fallback"))},
+            media_duration=None,
+        ).extract(self.config(AsrMode.QWEN3))
+        self.assertEqual(extracted.selected_backend, "qwen3")
+
+    def test_backend_failure_does_not_report_completion(self) -> None:
+        qwen = FakeBackend(RuntimeError("model crash"))
+        output = StringIO()
+        reporter = ProgressReporter(mode="on", stream=output)
+        extractor = self.extractor(
+            {"qwen3": qwen},
+            progress_factory=lambda _config: reporter,
+        )
+        with self.assertRaises(TranscriptionFailed):
+            extractor.extract(self.config(AsrMode.QWEN3))
+        self.assertIn("Transcription failed", output.getvalue())
+        self.assertNotIn("Completed in", output.getvalue())
 
 
 if __name__ == "__main__":

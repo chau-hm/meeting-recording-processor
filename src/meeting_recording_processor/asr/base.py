@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
+from ..progress import ProgressEvent
 from ..schemas import BackendResult
+
+
+ProgressCallback = Callable[[ProgressEvent], None]
 
 
 class AsrBackend(Protocol):
@@ -18,4 +22,5 @@ class AsrBackend(Protocol):
         *,
         language: str,
         profile_text: str | None,
+        progress_callback: ProgressCallback | None = None,
     ) -> BackendResult: ...

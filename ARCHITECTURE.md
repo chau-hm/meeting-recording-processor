@@ -5,7 +5,7 @@
 
 ## 1. System boundary
 
-Project 只有兩個本機、互不自動串連嘅 application flows：
+Project 有兩個本機、互不自動串連嘅 application flows；`batch` 只係逐一重用 `extract`：
 
 ```mermaid
 flowchart TD
@@ -14,6 +14,8 @@ flowchart TD
     C --> D["Stop / human review"]
     D --> E["export (explicit)"]
     E --> F["TXT + SRT"]
+    A -.-> BATCH["batch: file 1..N"]
+    BATCH --> B
 ```
 
 外部 AI cleanup、meeting notes 或 action items 唔係本 system component。影片 frame、cloud API 同 speaker identity 都不會進入 data flow。
@@ -53,7 +55,7 @@ stateDiagram-v2
 
 | Module | Responsibility | Boundary |
 |---|---|---|
-| `cli.py` | argparse、user messages、exit codes | 不載入 model |
+| `cli.py` | argparse、user messages、batch routing、exit codes | 不載入 model |
 | `config.py` | modes、paths、defaults、supported extensions | 不做 I/O pipeline |
 | `runtime.py` | Darwin/arm64、commands、HF offline env | 不做 inference |
 | `media/probe.py` | ffprobe JSON、audio stream selection | 不 decode transcript |
@@ -62,6 +64,7 @@ stateDiagram-v2
 | `models.py` | explicit download、offline snapshot resolve | extract 不連網 |
 | `asr/qwen3.py` | Qwen result → `BackendResult` | 不決定 fallback |
 | `asr/sensevoice.py` | WAV chunks → `BackendResult` | 不偽造 word timestamp |
+| `progress.py` | backend-neutral events、TTY/plain renderers、elapsed/percentage helpers | 不執行 ASR |
 | `quality.py` | objective hard-failure metrics | 不做內容評分 |
 | `postprocess.py` | NFC、whitespace、s2hk、cue grouping | 不翻譯／摘要／改寫 |
 | `pipeline.py` | lifecycle、routing、attempt preservation | 不輸出 TXT/SRT |
@@ -84,6 +87,7 @@ class AsrBackend(Protocol):
         *,
         language: str,
         profile_text: str | None,
+        progress_callback: Callable[[ProgressEvent], None] | None = None,
     ) -> BackendResult: ...
 ```
 
@@ -93,6 +97,7 @@ class AsrBackend(Protocol):
 
 - lazy import `mlx_qwen3_asr.transcribe`；
 - 使用 local snapshot path、`return_timestamps=True`、`return_chunks=True`；
+- 使用 pinned runtime 嘅 structured `on_progress` callback，將 processed audio seconds／total duration 轉成 generic progress events；
 - 優先讀 model segments，冇先讀 chunks；
 - 保存 finish reason、truncation 同 timestamp provenance。
 
@@ -100,6 +105,7 @@ class AsrBackend(Protocol):
 
 - lazy import `mlx_audio.stt.load`，直接載入 local snapshot path；
 - normalized WAV 以 30 秒分段，逐段 `generate(..., language="yue", use_itn=False)`；
+- 逐個完成 chunk 以實際 audio seconds 報告 progress；
 - 保存 chunk start/end、language/emotion/event（如 runtime 有提供）；
 - 原生冇 word timestamp，postprocessor 對每個 chunk 做 weighted cue estimation。
 
@@ -137,6 +143,15 @@ Segment `timing_source`：
 - `estimated_from_chunk`：有 chunk boundaries，cue 位置按字元權重估算；
 - `estimated_from_duration`：只有總 duration，整份文字按字元權重估算。
 
+Progress event phases：
+
+```text
+preparing → loading-model → transcribing → writing-output → completed
+                                                        ↘ failed
+```
+
+TTY renderer 更新單行；redirect／CI 使用 thresholded plain log lines。`current/total` 只在 backend 提供可靠 audio timestamp、duration 或 chunk count 時標為 determinate。
+
 ## 7. Filesystem and safety
 
 ```text
@@ -166,10 +181,11 @@ Backend-independent suite 注入 fake platform/probe/normalizer/signal/model/bac
 - explicit Qwen mode 不 fallback；
 - failed diagnostic JSON、attempt preservation、collision policy；
 - media command construction、signal analysis、text conversion/cue timing；
+- progress event math、TTY/plain/off rendering、backend failure cleanup、unknown duration tolerance、batch file index reporting；
 - completed/failed schema、TXT/SRT output、CLI defaults。
 
-支援平台上另需 integration smoke tests：兩個 model load、五種 input containers、影片 audio-only selection、offline cache miss/hit、長錄音 chunking 同實際 SRT sync。
+支援平台上另需 integration smoke tests：兩個 model load、六種 input containers、影片 audio-only selection、offline cache miss/hit、長錄音 chunking 同實際 SRT sync。
 
 ## 10. Traceability
 
-`scripts/transcribe-qwen3-baseline.sh` 同 batch variant 保留早期 Qwen CLI command line，方便比較 adapter output。Baseline 支援範圍唔等於 canonical v1 contract；正式功能只以 `mrp extract`／`mrp export`、本 spec 同 JSON Schema 為準。
+`scripts/transcribe-qwen3-baseline.sh` 同 legacy batch variant 保留早期 Qwen CLI command line，方便比較 adapter output。Baseline 支援範圍唔等於 canonical v1 contract；正式功能以 `mrp extract`／`mrp batch`／`mrp export`、本 spec 同 JSON Schema 為準。

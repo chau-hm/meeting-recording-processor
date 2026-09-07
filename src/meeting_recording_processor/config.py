@@ -13,7 +13,7 @@ class AsrMode(StrEnum):
     AUTO = "auto"
 
 
-SUPPORTED_EXTENSIONS = frozenset({".wav", ".m4a", ".mp3", ".mp4", ".mov"})
+SUPPORTED_EXTENSIONS = frozenset({".wav", ".m4a", ".mp3", ".flac", ".mp4", ".mov"})
 DEFAULT_QWEN_MODEL = "Qwen/Qwen3-ASR-1.7B"
 DEFAULT_SENSEVOICE_MODEL = "mlx-community/SenseVoiceSmall"
 
@@ -45,6 +45,7 @@ class ExtractConfig:
     keep_work_files: bool = False
     overwrite: bool = False
     verbose: bool = False
+    progress_mode: str | None = None
 
     @property
     def output_path(self) -> Path:

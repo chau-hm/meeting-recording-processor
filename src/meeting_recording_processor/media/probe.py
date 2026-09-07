@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import json
+import math
 from pathlib import Path
 import subprocess
 from typing import Any, Callable
@@ -52,9 +53,10 @@ def _optional_int(value: object) -> int | None:
 
 def _optional_float(value: object) -> float | None:
     try:
-        return float(value) if value is not None else None
+        result = float(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+    return result if result is not None and math.isfinite(result) and result >= 0 else None
 
 
 def probe_media(path: Path, *, runner: Runner = subprocess.run) -> MediaMetadata:
