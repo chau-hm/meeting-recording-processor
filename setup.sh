@@ -42,7 +42,7 @@ uv sync
 
 echo
 echo "Checking installed Python packages..."
-uv run python -c 'import huggingface_hub, mlx_audio, mlx_qwen3_asr, opencc; print("Python packages: OK")'
+uv run python -c 'import huggingface_hub, mlx_audio, mlx_qwen3_asr, opencc, torch, transformers; print("Python packages: OK")'
 
 echo
 echo "Setup complete."

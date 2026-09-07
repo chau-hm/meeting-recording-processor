@@ -30,7 +30,7 @@
 
 - 以 `ffprobe` 讀 metadata、duration 並選擇第一條 audio stream；duration 缺失或無效時唔阻止 ASR，進度會退回 indeterminate。
 - 冇 audio stream 時失敗；影片 frame 永遠唔會傳入 ASR。
-- 以明確 stream map 將 audio normalize 成 16 kHz、mono、16-bit PCM WAV。
+- Qwen3/SenseVoice 以明確 stream map 將 audio normalize 成 16 kHz、mono、16-bit PCM WAV；VibeVoice 明確 mode 使用 24 kHz、mono、16-bit PCM WAV。
 - 記錄 container、duration、stream、signal stats、ffprobe version。
 
 ### FR-03 ASR backends
@@ -39,9 +39,10 @@
 |---|---|---|
 | `qwen3` | `mlx-qwen3-asr==0.3.5`, `Qwen/Qwen3-ASR-1.7B` | 單一 attempt；失敗不 fallback |
 | `sensevoice` | `mlx-audio==0.4.1`, `mlx-community/SenseVoiceSmall` | 單一 attempt；30 秒 chunk inference |
-| `auto` | 以上兩者 | 先 Qwen3；只因 hard failure fallback |
+| `vibevoice` | `torch`, `transformers>=5.3.0,<5.4.0`, `microsoft/VibeVoice-ASR-HF` | explicit evaluation；MPS、24 kHz、FP32、最多 60 分鐘；失敗不 fallback |
+| `auto` | Qwen3 + SenseVoice | 先 Qwen3；只因 hard failure fallback；不包括 VibeVoice |
 
-Backend imports 同 model load 必須 lazy；CLI help、schema、export、unit tests 唔應觸發 MLX import或下載。
+Backend imports 同 model load 必須 lazy；CLI help、schema、export、unit tests 唔應觸發 MLX/Transformers import 或下載。
 
 ### FR-04 Objective fallback
 
@@ -52,7 +53,7 @@ Qwen3 attempt 符合任一條件時，`auto` 先執行 SenseVoice：
 3. 非空白字元中，Unicode punctuation/symbol 比例 `> 0.90`；
 4. WAV signal detector 測到 active audio `>= 10.0s`，但 Unicode letter/number 少過 3 個。
 
-專有名詞錯誤、一般 accuracy、標點或分段差異屬主觀品質，唔觸發 fallback。系統唔自動比較、融合或刪除 attempts。明確 `--asr qwen3`／`--asr sensevoice` 絕不暗中改用另一 backend。
+專有名詞錯誤、一般 accuracy、標點或分段差異屬主觀品質，唔觸發 fallback。系統唔自動比較、融合或刪除 attempts。明確 `--asr qwen3`／`--asr sensevoice`／`--asr vibevoice` 絕不暗中改用另一 backend。
 
 ### FR-05 Offline and models
 
@@ -60,6 +61,7 @@ Qwen3 attempt 符合任一條件時，`auto` 先執行 SenseVoice：
 - 缺少 snapshot 時提示先執行 `download-model`，不使用 cloud API 或其他 model。
 - 只有 `download-model` command 可啟用 network 下載。
 - 預設 cache 為 `<project>/.cache/huggingface/`；cache path 同 snapshot id 寫入 provenance。
+- VibeVoice 使用 native Transformers API，extract 只會由已 resolve 嘅 local snapshot 建立 processor/model。
 
 ### FR-06 Text policy
 
@@ -68,10 +70,14 @@ Qwen3 attempt 符合任一條件時，`auto` 先執行 SenseVoice：
 - canonical text 只做 Unicode NFC、control/whitespace normalization、OpenCC `s2hk` 同 subtitle cue grouping。
 - 唔翻譯、唔摘要、唔將廣東話改寫成普通話書面語。
 - context file 係 opt-in；path、SHA-256 同 backend limitation 寫入 JSON。
+- `request.language` 係 user/default request；`transcript.language` 只代表 backend 已知／檢測到嘅語言。
+- VibeVoice 嘅 `--language` 不作 model conditioning 或 detection；只記錄 `metadata.requested_language`，`metadata.language_mode` 為 `not_detected`，canonical `transcript.language` 為 `und`。`profile_text` 只經 verified `prompt` interface 傳入。
 
 ### FR-07 Timing
 
 - Qwen word/model timestamps 轉成 canonical segments，`timing_source` 為 `model`。
+- VibeVoice 只有完整 structured `Start`／`End`／`Content` records 全部通過 validation 先會轉成 canonical segments，`timing_source` 為 `model`；speaker id 只保留喺 attempt metadata。
+- VibeVoice 任何 malformed／incomplete structured record 都會令該 attempt 使用零個 model segments；完整 transcription text 會保留，postprocessor 改用 project 嘅 estimated timing path，並保留 raw／parse diagnostics。
 - Qwen 如只得 chunk timing，或 SenseVoice chunk output，cue timing必須標成估算來源。
 - 完全冇 timestamp 時，按 audio duration 同文字長度估算，並加入 warning。
 - SRT 只由 canonical segments 產生，唔聲稱 estimated timing 係 word-level timestamp。
@@ -82,6 +88,7 @@ Qwen3 attempt 符合任一條件時，`auto` 先執行 SenseVoice：
 - Qwen3 以 runtime structured progress callback 嘅 processed audio seconds／total duration 報告實際 transcription progress；無可靠 total 時唔顯示百分比。
 - TTY 使用 compact updating display；非 TTY 只輸出 plain log lines，唔包含 cursor-control escape sequences。
 - `ASR_PROGRESS=auto|on|off` 控制 progress output，亦可用 `--progress`；預設係 `auto`。
+- VibeVoice 暫時冇 verified processed-audio progress source，transcribing phase 使用 indeterminate progress，唔由 elapsed time 或 token count 估算百分比。
 - `batch` 顯示 current file index、total files、filename，同 current file 嘅 progress；唔以檔案數量冒充 duration-weighted aggregate。
 - Progress renderer 或 backend callback 出現普通 I/O／reporting exception 時必須 fail open：停用後續 progress output，但唔可以改變 ASR、quality gate 或 fallback；`KeyboardInterrupt` 仍然要傳出。
 - Rendered lifecycle phases 只可以向前行；成功而無 fallback 嘅 run 順序係 `transcribing → writing-output → completed`。`auto` objective hard failure 會先輸出 backend-neutral `fallback` transition（顯示下一個 model loading），再由下一個 backend 以自己嘅 `transcribing` progress 重新由 0% 開始；failed run 絕不輸出 `completed`。
@@ -118,7 +125,7 @@ JSON 包含 source metadata/hash、request、immutable attempts、selected attem
 
 ```text
 mrp extract INPUT
-  [--asr auto|qwen3|sensevoice]
+  [--asr auto|qwen3|sensevoice|vibevoice]
   [--language VALUE]
   [--context-file PATH]
   [--output-dir PATH]
@@ -126,6 +133,7 @@ mrp extract INPUT
   [--cache-dir PATH]
   [--qwen-model MODEL_ID]
   [--sensevoice-model MODEL_ID]
+  [--vibevoice-model MODEL_ID]
   [--keep-work-files]
   [--overwrite]
   [--verbose]
@@ -139,7 +147,7 @@ mrp export TRANSCRIPT_JSON
   [--overwrite]
 
 mrp doctor [--cache-dir PATH] [--json]
-mrp download-model [--asr qwen3|sensevoice|all] [model/cache overrides]
+mrp download-model [--asr qwen3|sensevoice|vibevoice|all] [model/cache overrides]
 mrp cache-size [--cache-dir PATH]
 ```
 
@@ -181,6 +189,7 @@ Normative machine-readable schema：`schemas/transcript-v1.schema.json`。
 
 - **Privacy：** runtime 不 upload media、transcript、context 或 metadata。
 - **Auditability：** model id/snapshot、attempt raw output、fallback reason、版本、hash 可追溯。
+- **VibeVoice runtime readiness：** `doctor` 分開報告 `torch`／`transformers` package presence 同 `torch.backends.mps.is_available()`；MPS unavailable 時 `healthy` 為 false。
 - **Determinism：** media parameters、post-processing、quality thresholds 固定。
 - **Safety：** input immutable、output fail-on-collision、atomic write、scoped work cleanup。
 - **Testability：** platform/media/model/backend 全部可注入 fake；unit tests 無需大型 model。
@@ -189,7 +198,7 @@ Normative machine-readable schema：`schemas/transcript-v1.schema.json`。
 ## 6. Acceptance status
 
 - [x] 完整 canonical CLI：`extract`／`export`／`doctor`／model/cache commands。
-- [x] input validation、ffprobe、explicit stream selection、16 kHz mono normalization。
+- [x] input validation、ffprobe、explicit stream selection、Qwen3/SenseVoice 16 kHz mono normalization。
 - [x] Qwen3 同 SenseVoice adapter；backend lazy load。
 - [x] `auto` 客觀 hard-failure routing；明確 mode 無 silent fallback。
 - [x] raw attempts、quality、snapshot、provenance 同 failed diagnostic preservation。
@@ -198,9 +207,11 @@ Normative machine-readable schema：`schemas/transcript-v1.schema.json`。
 - [x] unit/integration tests 無需真 model。
 - [x] TTY/plain progress、indeterminate fallback、batch file reporting 同 failure cleanup。
 - [x] shell wrappers、baseline preservation、完整文件同 JSON Schema。
+- [x] VibeVoice explicit backend、native Transformers model management、24 kHz media path、FP32 MPS contract、all-or-nothing structured timing、language provenance、MPS doctor readiness 同 model-free tests。
 - [ ] Apple Silicon 實機下載兩個 models 並完成真實 M4A/MP3/WAV/FLAC/MP4/MOV smoke test。
+- [ ] Apple Silicon 實機下載 VibeVoice、MPS offline inference 同 structured speaker/timestamp smoke test。
 - [ ] Apple Silicon 上產生／驗證 `uv.lock` 同量度 cache/runtime disk usage。
 
 ## 7. Deferred／out of scope
 
-Speaker diarization、live captions、Whisper、cloud ASR、video OCR/frame analysis、automatic transcript cleanup、meeting-note/action-item generation。任何新增功能必須另行更新 privacy、schema 同 acceptance contract。
+Canonical speaker/diarization schema promotion、VibeVoice streaming、>60 分鐘 segmentation/reconciliation、live captions、Whisper、cloud ASR、video OCR/frame analysis、automatic transcript cleanup、meeting-note/action-item generation。任何新增功能必須另行更新 privacy、schema 同 acceptance contract。

@@ -6,8 +6,14 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from meeting_recording_processor.cli import _run_batch, build_parser
+from meeting_recording_processor.cli import (
+    _run_batch,
+    _run_doctor,
+    _run_download,
+    build_parser,
+)
 from meeting_recording_processor.errors import ConfigurationError
+from meeting_recording_processor.models import ResolvedModel
 
 
 class CliTests(unittest.TestCase):
@@ -28,6 +34,77 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.command, "batch")
         self.assertEqual(args.asr, "qwen3")
         self.assertEqual(args.progress_mode, "off")
+
+    def test_vibevoice_parser_and_model_override(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "extract",
+                "meeting.m4a",
+                "--asr",
+                "vibevoice",
+                "--vibevoice-model",
+                "local/vibevoice",
+            ]
+        )
+        self.assertEqual(args.asr, "vibevoice")
+        self.assertEqual(args.vibevoice_model, "local/vibevoice")
+
+    def test_download_parser_supports_vibevoice_and_all(self) -> None:
+        vibevoice = build_parser().parse_args(
+            ["download-model", "--asr", "vibevoice"]
+        )
+        all_models = build_parser().parse_args(["download-model", "--asr", "all"])
+        self.assertEqual(vibevoice.asr, "vibevoice")
+        self.assertEqual(all_models.asr, "all")
+
+    def test_download_all_includes_vibevoice(self) -> None:
+        args = build_parser().parse_args(["download-model", "--asr", "all"])
+        downloaded: list[tuple[str, Path]] = []
+        with (
+            patch("meeting_recording_processor.cli.require_apple_silicon"),
+            patch(
+                "meeting_recording_processor.cli.download_model",
+                side_effect=lambda model_id, cache_dir: (
+                    downloaded.append((model_id, cache_dir))
+                    or ResolvedModel(model_id, cache_dir, "snapshot")
+                ),
+            ),
+            patch("meeting_recording_processor.cli.directory_size", return_value=0),
+            patch("meeting_recording_processor.cli.human_size", return_value="0 B"),
+        ):
+            result = _run_download(args)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            [model_id for model_id, _cache_dir in downloaded],
+            [
+                args.qwen_model,
+                args.sensevoice_model,
+                args.vibevoice_model,
+            ],
+        )
+
+    def test_doctor_prints_vibevoice_mps_runtime_status(self) -> None:
+        args = build_parser().parse_args(["doctor"])
+        output = StringIO()
+        report = {
+            "platform": {"system": "Darwin", "machine": "arm64"},
+            "python": {"version": "3.12.0"},
+            "commands": {},
+            "packages": {},
+            "runtime": {"vibevoice-mps": {"available": False}},
+            "models": {},
+            "cache_dir": "/tmp/cache",
+            "healthy": False,
+        }
+        with (
+            patch("meeting_recording_processor.cli.doctor_report", return_value=report),
+            redirect_stdout(output),
+        ):
+            result = _run_doctor(args)
+
+        self.assertEqual(result, 1)
+        self.assertIn("MISSING runtime:vibevoice-mps", output.getvalue())
 
     def test_batch_reports_file_index_and_total(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -1,5 +1,7 @@
 """Domain-specific exceptions with stable CLI exit categories."""
 
+from typing import Any
+
 
 class ProcessorError(Exception):
     """Base class for expected user-facing failures."""
@@ -23,6 +25,17 @@ class ModelUnavailableError(ProcessorError):
 
 class BackendError(ProcessorError):
     """An ASR backend failed to return a usable result."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+        warnings: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.metadata = metadata or {}
+        self.warnings = warnings
 
 
 class SchemaError(ProcessorError):
