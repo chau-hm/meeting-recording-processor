@@ -214,8 +214,10 @@ offline，加 `local_files_only=True` resolve；Qwen timestamp preflight 會先 
 assets，cache miss 轉成 domain error，絕不傳 media 到 remote service。VibeVoice 嘅 native
 processor/model 亦只接受 local snapshot path，唔會喺 extract 以 model id 觸發 remote fetch。
 `clear-model` 同 `benchmark` 使用 `models.py` 嘅同一 typed inventory；clear 透過
-`huggingface_hub.scan_cache_dir` 同 `DeleteCacheStrategy` 只刪選定 repositories 嘅 cached
-revisions，benchmark 只用 cache scan 判斷 installed，唔呼叫 download path。`doctor` 只會
+`huggingface_hub.scan_cache_dir`、`DeleteCacheStrategy` 同 repository-scoped incomplete-file
+metadata 只刪選定 repositories 嘅 cached revisions／partial downloads。Benchmark 先用 cache
+scan 識別 presence，再對每個 required asset 做 local-only snapshot resolution 判斷 complete，
+唔呼叫 download path。`doctor` 只會
 import torch 並檢查 `torch.backends.mps.is_available()`，唔會載入 VibeVoice model；MPS
 capability 會獨立列喺 `runtime.vibevoice-mps`，並納入 `healthy`。
 

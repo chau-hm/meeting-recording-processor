@@ -142,7 +142,8 @@ uv run mrp download-model --asr vibevoice
 `clear-model` 必須明確指定 `--asr qwen3|sensevoice|vibevoice|all`，預設唔會
 清理任何 model。Qwen3 係一個 ASR + forced aligner model set；即使其中一個
 asset 已經缺失，清理仍會移除另一個並報告各 asset 狀態。清理只會透過
-Hugging Face cache API 移除所選 repository 嘅 cached revisions。
+Hugging Face cache API 移除所選 repository 嘅 cached revisions，同埋同一 repository
+底下嘅 interrupted `.incomplete` download files；其他 repository 完全唔會觸碰。
 
 ### Local ASR benchmark
 
@@ -153,8 +154,9 @@ uv run mrp benchmark meeting.mp4
 uv run mrp benchmark meeting.mp4 --include-experimental
 ```
 
-預設只會嘗試本機已完整安裝、runtime 可用嘅 Qwen3 同 SenseVoice；Qwen3
-必須同時有 ASR model 同 forced aligner。缺少 model 或 runtime 會記錄為
+預設只會嘗試本機已完整安裝、可以 offline resolve、runtime 可用嘅 Qwen3 同 SenseVoice；
+Qwen3 必須同時有 ASR model 同 forced aligner，而且兩個 asset 都要成功 local-only
+resolve。缺少、未完成或無法 offline resolve 嘅 model，或者 runtime 不可用，會記錄為
 `skipped`，唔會觸發下載。VibeVoice 係 experimental，只有
 `--include-experimental` 先會考慮，而且未 cache 或 runtime 未 ready 時會
 skip。每個 backend 都用 explicit mode 執行，Qwen3 失敗唔會喺 benchmark

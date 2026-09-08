@@ -23,9 +23,9 @@ uv run mrp clear-model --asr vibevoice
 uv run mrp clear-model --asr qwen3 --dry-run
 ```
 
-`clear-model` 只會刪 configured Hugging Face cache 內所選 repository 嘅 revisions，
-唔會刪 input、output、work、`.venv` 或其他 models；Qwen3 會同時處理 ASR 同 forced
-aligner。之後可用 `uv run mrp download-model --asr <model-set>` 還原；model
+`clear-model` 只會刪 configured Hugging Face cache 內所選 repository 嘅 revisions 同
+repository-scoped `.incomplete` download files，唔會刪 input、output、work、`.venv` 或其他
+models；Qwen3 會同時處理 ASR 同 forced aligner。之後可用 `uv run mrp download-model --asr <model-set>` 還原；model
 download 仍然係唯一可連網步驟，例如 `uv run mrp download-model --asr vibevoice`。
 5. 唔可以 upload media、transcript 或 context，亦唔可以改用 cloud ASR。
 
@@ -82,9 +82,9 @@ uv run mrp benchmark meeting.mp4
 uv run mrp benchmark meeting.mp4 --include-experimental
 ```
 
-Benchmark 預設只會 sequentially 嘗試完整 installed 嘅 Qwen3 同 SenseVoice，
+Benchmark 預設只會 sequentially 嘗試完整、可 offline resolve、installed 嘅 Qwen3 同 SenseVoice，
 每個 backend 都係 explicit extraction，唔使用 `auto`，亦永遠唔下載 model。Qwen3
-缺少 ASR 或 forced aligner、SenseVoice 缺少 model、或 runtime prerequisite
+缺少 ASR 或 forced aligner、任一 required asset 無法 local-only resolve、SenseVoice 缺少 model、或 runtime prerequisite
 不可用時會 `skipped`；VibeVoice 係 experimental，只有 `--include-experimental`
 先 eligible。輸出會隔離喺 `output/benchmark/<input-stem>/<backend>/`，並寫
 `benchmark.json`。Runtime／RTF 只代表 performance，唔係 accuracy；冇 reference

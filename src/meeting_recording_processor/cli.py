@@ -394,8 +394,18 @@ def _run_clear_model(args: argparse.Namespace) -> int:
         print(f"Model set: {model_set.backend}")
         print()
         for asset in result.assets:
-            state = "yes" if asset.installed else "no"
-            print(f"{asset.asset.model_id}\n  installed: {state}")
+            installed = "yes" if asset.installed else "no"
+            cached = "yes" if asset.cached else "no"
+            print(
+                f"{asset.asset.model_id}\n"
+                f"  installed: {installed}\n"
+                f"  cached revisions: {cached}"
+            )
+            if asset.incomplete_file_count:
+                print(
+                    "  incomplete download: yes "
+                    f"({human_size(asset.incomplete_size_bytes)})"
+                )
         print()
         print(f"Will free: {human_size(result.expected_freed_bytes)}")
         if args.dry_run:

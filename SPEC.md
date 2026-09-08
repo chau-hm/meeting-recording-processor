@@ -68,9 +68,10 @@ Qwen3 attempt 符合任一條件時，`auto` 先執行 SenseVoice：
   set；預設唔會清理。Qwen3 model set 必須同時包括 ASR repository 同 forced aligner
   repository，clear 時兩者都會處理。
 - `clear-model --dry-run` 只掃描指定 Hugging Face cache、顯示每個 asset 是否已安裝同
-  預計釋放空間，絕不執行 deletion。實際清理只會使用 cache API 移除所選 repository
-  嘅全部 cached revisions，唔會觸碰 input、output、work、`.venv` 或其他 repository；
-  `download-model` 可以重新建立已刪除 assets。
+  預計釋放空間，絕不執行 deletion。實際清理會使用 cache API 移除所選 repository
+  嘅全部 cached revisions，同埋安全識別到嘅同 repository `.incomplete` download files；
+  唔會觸碰 input、output、work、`.venv` 或其他 repository。`download-model` 可以重新建立
+  已刪除 assets。
 
 ### FR-06 Text policy
 
@@ -145,9 +146,9 @@ JSON 包含 source metadata/hash、request、immutable attempts、selected attem
 
 ### FR-10 Model lifecycle and local benchmark
 
-- `benchmark INPUT` 只使用已完整存在於 configured local cache 嘅 model set；唔可以呼叫
-  `download-model` 或以 network-enabled mode resolve model。Qwen3 只有 ASR + forced
-  aligner 兩個 repository 都存在時先算 installed。
+- `benchmark INPUT` 只使用已完整存在、並可由 configured local cache offline resolve 嘅 model
+  set；唔可以呼叫 `download-model` 或以 network-enabled mode resolve model。Qwen3 只有
+  ASR + forced aligner 兩個 repository 都成功 local-only resolve 時先算 installed。
 - 預設 candidate 順序係 `qwen3`、`sensevoice`；VibeVoice 只會喺
   `--include-experimental` opt-in 後 eligibility check。Missing model asset 或 runtime
   prerequisite 記錄為 `skipped`，唔會令其他 backend 停止。

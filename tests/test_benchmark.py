@@ -3,15 +3,22 @@ from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from meeting_recording_processor.benchmark import run_benchmark
 from meeting_recording_processor.config import BenchmarkConfig, AsrMode
-from meeting_recording_processor.errors import OutputExistsError, TranscriptionFailed
+from meeting_recording_processor.errors import (
+    ModelUnavailableError,
+    OutputExistsError,
+    TranscriptionFailed,
+)
 from meeting_recording_processor.media.probe import MediaMetadata
 from meeting_recording_processor.models import (
     ModelAssetStatus,
     ModelSetStatus,
+    ResolvedModel,
     build_model_inventory,
+    inspect_model_sets,
 )
 from meeting_recording_processor.schema_io import write_package
 
@@ -46,6 +53,17 @@ def completed_package(backend: str, text: str) -> dict:
     }
 
 
+def failed_package() -> dict:
+    return {
+        "schema_version": "1.0",
+        "status": "failed",
+        "run_id": "failed-run",
+        "attempts": [],
+        "selected_attempt_id": None,
+        "transcript": None,
+    }
+
+
 class BenchmarkTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -72,7 +90,11 @@ class BenchmarkTests(unittest.TestCase):
             ModelSetStatus(
                 model_set=model_set,
                 assets=tuple(
-                    ModelAssetStatus(asset, asset.model_id not in missing)
+                    ModelAssetStatus(
+                        asset=asset,
+                        cached=asset.model_id not in missing,
+                        complete=asset.model_id not in missing,
+                    )
                     for asset in model_set.assets
                 ),
             )
@@ -87,6 +109,7 @@ class BenchmarkTests(unittest.TestCase):
         include_experimental: bool = False,
         overwrite: bool = False,
         clock_values: tuple[float, ...] = (0.0, 10.0, 10.0, 15.0),
+        model_status_inspector=None,
     ):
         calls = []
         if extractor is None:
@@ -100,6 +123,11 @@ class BenchmarkTests(unittest.TestCase):
                 return SimpleNamespace(output_path=config.output_path)
 
         clock_values_iter = iter(clock_values)
+        status_inspector = model_status_inspector
+        if status_inspector is None:
+            status_inspector = lambda _cache, _inventory: (
+                statuses if statuses is not None else self.statuses()
+            )
         result = run_benchmark(
             self.config(
                 include_experimental=include_experimental,
@@ -107,9 +135,7 @@ class BenchmarkTests(unittest.TestCase):
             ),
             extractor=extractor,
             media_probe=lambda _path: MediaMetadata("m4a", 10.0, (), 0),
-            model_status_inspector=lambda _cache, _inventory: (
-                statuses if statuses is not None else self.statuses()
-            ),
+            model_status_inspector=status_inspector,
             runtime_checker=lambda _model_set: None,
             clock=lambda: next(clock_values_iter),
         )
@@ -176,8 +202,145 @@ class BenchmarkTests(unittest.TestCase):
 
         self.assertEqual(calls, [AsrMode.QWEN3, AsrMode.SENSEVOICE])
         self.assertEqual(result.results[0]["status"], "failed")
+        self.assertIsNone(result.results[0]["output"])
         self.assertEqual(result.results[1]["status"], "passed")
         self.assertEqual(result.passed_count, 1)
+
+    def test_failed_diagnostic_path_is_preserved_and_later_backend_runs(self) -> None:
+        calls = []
+
+        def extractor(config):
+            calls.append(config.asr_mode)
+            config.output_dir.mkdir(parents=True, exist_ok=True)
+            if config.asr_mode is AsrMode.QWEN3:
+                write_package(config.output_path, failed_package())
+                raise TranscriptionFailed(
+                    "qwen failed",
+                    diagnostic_path=config.output_path,
+                )
+            write_package(
+                config.output_path,
+                completed_package("sensevoice", "sensevoice text"),
+            )
+            return SimpleNamespace(output_path=config.output_path)
+
+        result, _unused = self.execute(
+            extractor=extractor,
+            clock_values=(0.0, 2.0, 2.0, 5.0),
+        )
+
+        self.assertEqual(calls, [AsrMode.QWEN3, AsrMode.SENSEVOICE])
+        self.assertEqual(result.results[0]["status"], "failed")
+        self.assertEqual(
+            result.results[0]["output"],
+            "qwen3/meeting.transcript.json",
+        )
+        self.assertIsNone(result.results[0]["character_count"])
+        self.assertEqual(result.results[1]["status"], "passed")
+
+    def test_failed_diagnostic_path_outside_backend_area_is_not_serialized(self) -> None:
+        outside = self.root / "outside.transcript.json"
+        outside.write_text("diagnostic", encoding="utf-8")
+
+        def extractor(config):
+            if config.asr_mode is AsrMode.QWEN3:
+                raise TranscriptionFailed(
+                    "qwen failed",
+                    diagnostic_path=outside,
+                )
+            config.output_dir.mkdir(parents=True, exist_ok=True)
+            write_package(
+                config.output_path,
+                completed_package("sensevoice", "sensevoice text"),
+            )
+            return SimpleNamespace(output_path=config.output_path)
+
+        result, _unused = self.execute(
+            extractor=extractor,
+            clock_values=(0.0, 2.0, 2.0, 5.0),
+        )
+
+        self.assertEqual(result.results[0]["status"], "failed")
+        self.assertIsNone(result.results[0]["output"])
+
+    def test_incomplete_qwen_resolution_skips_qwen_without_blocking_sensevoice(self) -> None:
+        qwen, sensevoice, _vibevoice = self.inventory
+        repositories = tuple(
+            SimpleNamespace(
+                repo_id=asset.model_id,
+                repo_type="model",
+                revisions=(SimpleNamespace(commit_hash=f"{asset.name}-revision"),),
+                size_on_disk=1,
+            )
+            for model_set in (qwen, sensevoice)
+            for asset in model_set.assets
+        )
+        resolve_calls: list[str] = []
+
+        def resolve(model_id, _cache_dir):
+            resolve_calls.append(model_id)
+            if model_id == qwen.assets[0].model_id:
+                raise ModelUnavailableError("incomplete local snapshot")
+            return ResolvedModel(model_id, self.root / "snapshot", "revision")
+
+        cache_dir = self.config().cache_dir
+        (cache_dir / "hub").mkdir(parents=True)
+        with (
+            patch(
+                "huggingface_hub.scan_cache_dir",
+                return_value=SimpleNamespace(repos=repositories, incomplete_files=()),
+            ),
+            patch(
+                "meeting_recording_processor.models.resolve_cached_model",
+                side_effect=resolve,
+            ),
+            patch(
+                "meeting_recording_processor.models.download_model",
+                side_effect=AssertionError("benchmark must not download models"),
+            ),
+        ):
+            result, calls = self.execute(
+                extractor=None,
+                model_status_inspector=inspect_model_sets,
+            )
+
+        self.assertEqual([config.asr_mode for config in calls], [AsrMode.SENSEVOICE])
+        self.assertEqual(result.results[0]["status"], "skipped")
+        self.assertEqual(result.results[1]["status"], "passed")
+        self.assertIn(qwen.assets[0].model_id, resolve_calls)
+
+    def test_incomplete_sensevoice_resolution_is_skipped(self) -> None:
+        sensevoice = self.inventory[1]
+        repository = SimpleNamespace(
+            repo_id=sensevoice.assets[0].model_id,
+            repo_type="model",
+            revisions=(SimpleNamespace(commit_hash="sensevoice-revision"),),
+            size_on_disk=1,
+        )
+        cache_dir = self.config().cache_dir
+        (cache_dir / "hub").mkdir(parents=True)
+
+        with (
+            patch(
+                "huggingface_hub.scan_cache_dir",
+                return_value=SimpleNamespace(
+                    repos=(repository,),
+                    incomplete_files=(),
+                ),
+            ),
+            patch(
+                "meeting_recording_processor.models.resolve_cached_model",
+                side_effect=ModelUnavailableError("incomplete local snapshot"),
+            ),
+        ):
+            result, calls = self.execute(
+                extractor=None,
+                model_status_inspector=inspect_model_sets,
+            )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(result.results[1]["status"], "skipped")
+        self.assertIn(sensevoice.assets[0].model_id, result.results[1]["reason"])
 
     def test_include_experimental_makes_cached_vibevoice_eligible(self) -> None:
         result, calls = self.execute(

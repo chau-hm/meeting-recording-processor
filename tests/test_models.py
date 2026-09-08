@@ -8,6 +8,7 @@ from unittest.mock import patch
 from meeting_recording_processor.models import (
     ModelAssetStatus,
     ModelSetStatus,
+    ResolvedModel,
     build_model_inventory,
     clear_model_set,
     inspect_model_sets,
@@ -54,8 +55,13 @@ class FakeRepository:
 
 
 class FakeCacheInfo:
-    def __init__(self, repositories: set[FakeRepository]) -> None:
+    def __init__(
+        self,
+        repositories: set[FakeRepository],
+        incomplete_files: tuple[object, ...] = (),
+    ) -> None:
         self.repos = repositories
+        self.incomplete_files = incomplete_files
 
     def delete_revisions(self, *revisions: str) -> FakeStrategy:
         selected: list[FakeStrategy] = []
@@ -77,7 +83,11 @@ def _statuses(inventory, *, missing: set[str] = set()) -> tuple[ModelSetStatus, 
         ModelSetStatus(
             model_set=model_set,
             assets=tuple(
-                ModelAssetStatus(asset, asset.model_id not in missing)
+                ModelAssetStatus(
+                    asset=asset,
+                    cached=asset.model_id not in missing,
+                    complete=asset.model_id not in missing,
+                )
                 for asset in model_set.assets
             ),
         )
@@ -118,6 +128,13 @@ class ModelLifecycleTests(unittest.TestCase):
             with patch(
                 "huggingface_hub.scan_cache_dir",
                 return_value=SimpleNamespace(repos={asr_repository}),
+            ), patch(
+                "meeting_recording_processor.models.resolve_cached_model",
+                return_value=ResolvedModel(
+                    qwen.assets[0].model_id,
+                    cache_dir / "hub" / "snapshot",
+                    "asr-revision",
+                ),
             ):
                 statuses = inspect_model_sets(cache_dir, (qwen, sensevoice))
 
@@ -125,6 +142,40 @@ class ModelLifecycleTests(unittest.TestCase):
         self.assertTrue(statuses[0].assets[0].installed)
         self.assertFalse(statuses[0].assets[1].installed)
         self.assertFalse(statuses[1].installed)
+
+    def test_model_completeness_resolution_is_local_only(self) -> None:
+        sensevoice = build_model_inventory()[1]
+        repository = FakeRepository(
+            sensevoice.assets[0].model_id,
+            ("sensevoice-revision",),
+            FakeStrategy(10),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            cache_dir = Path(temporary)
+            (cache_dir / "hub").mkdir()
+            with (
+                patch(
+                    "huggingface_hub.scan_cache_dir",
+                    return_value=SimpleNamespace(repos={repository}),
+                ),
+                patch(
+                    "huggingface_hub.snapshot_download",
+                    return_value=str(cache_dir / "hub" / "snapshot"),
+                ) as snapshot_download,
+                patch(
+                    "meeting_recording_processor.models.download_model",
+                    side_effect=AssertionError("model inspection must not download"),
+                ),
+            ):
+                status = inspect_model_sets(cache_dir, (sensevoice,))[0]
+
+        self.assertTrue(status.installed)
+        snapshot_download.assert_called_once_with(
+            repo_id=sensevoice.assets[0].model_id,
+            cache_dir=str((cache_dir / "hub").resolve()),
+            local_files_only=True,
+        )
 
     def test_clear_model_deletes_only_selected_repositories_and_all_revisions(self) -> None:
         inventory = build_model_inventory()
@@ -166,6 +217,13 @@ class ModelLifecycleTests(unittest.TestCase):
                         unrelated_repository,
                     }
                 ),
+            ), patch(
+                "meeting_recording_processor.models.resolve_cached_model",
+                side_effect=lambda model_id, _cache_dir: ResolvedModel(
+                    model_id,
+                    cache_dir / "hub" / "snapshot",
+                    "snapshot",
+                ),
             ):
                 result = clear_model_set(qwen, cache_dir)
 
@@ -191,6 +249,13 @@ class ModelLifecycleTests(unittest.TestCase):
             with patch(
                 "huggingface_hub.scan_cache_dir",
                 return_value=FakeCacheInfo({asr_repository}),
+            ), patch(
+                "meeting_recording_processor.models.resolve_cached_model",
+                return_value=ResolvedModel(
+                    qwen.assets[0].model_id,
+                    cache_dir / "hub" / "snapshot",
+                    "asr-a",
+                ),
             ):
                 result = clear_model_set(qwen, cache_dir, dry_run=True)
 
@@ -201,6 +266,214 @@ class ModelLifecycleTests(unittest.TestCase):
         self.assertEqual(result.expected_freed_bytes, 512)
         self.assertEqual(strategy.execute_calls, 0)
         self.assertTrue(result.dry_run)
+
+    def test_clear_model_removes_selected_incomplete_files_only(self) -> None:
+        vibevoice = build_model_inventory()[2]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            cache_dir = Path(temporary)
+            hub_dir = cache_dir / "hub"
+            selected = (
+                hub_dir
+                / "models--microsoft--VibeVoice-ASR-HF"
+                / "blobs"
+                / "selected.incomplete"
+            )
+            unrelated = (
+                hub_dir
+                / "models--unrelated--model"
+                / "blobs"
+                / "unrelated.incomplete"
+            )
+            selected.parent.mkdir(parents=True)
+            unrelated.parent.mkdir(parents=True)
+            selected.write_bytes(b"selected")
+            unrelated.write_bytes(b"unrelated")
+            cache_info = SimpleNamespace(
+                repos=(),
+                incomplete_files=(
+                    SimpleNamespace(file_path=selected, size_on_disk=selected.stat().st_size),
+                    SimpleNamespace(file_path=unrelated, size_on_disk=unrelated.stat().st_size),
+                ),
+            )
+            with patch(
+                "huggingface_hub.scan_cache_dir",
+                return_value=cache_info,
+            ):
+                result = clear_model_set(vibevoice, cache_dir)
+
+            self.assertFalse(selected.exists())
+            self.assertTrue(unrelated.exists())
+
+        self.assertFalse(result.assets[0].cached)
+        self.assertFalse(result.assets[0].installed)
+        self.assertEqual(result.assets[0].incomplete_file_count, 1)
+        self.assertEqual(result.expected_freed_bytes, len(b"selected"))
+
+    def test_clear_model_dry_run_includes_selected_incomplete_size(self) -> None:
+        sensevoice = build_model_inventory()[1]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            cache_dir = Path(temporary)
+            selected = (
+                cache_dir
+                / "hub"
+                / "models--mlx-community--SenseVoiceSmall"
+                / "blobs"
+                / "selected.incomplete"
+            )
+            selected.parent.mkdir(parents=True)
+            selected.write_bytes(b"partial model")
+            with patch(
+                "huggingface_hub.scan_cache_dir",
+                return_value=SimpleNamespace(
+                    repos=(),
+                    incomplete_files=(
+                        SimpleNamespace(
+                            file_path=selected,
+                            size_on_disk=selected.stat().st_size,
+                        ),
+                    ),
+                ),
+            ):
+                result = clear_model_set(sensevoice, cache_dir, dry_run=True)
+
+            self.assertTrue(selected.exists())
+
+        self.assertEqual(result.expected_freed_bytes, len(b"partial model"))
+        self.assertEqual(result.assets[0].incomplete_file_count, 1)
+        self.assertEqual(
+            result.assets[0].incomplete_size_bytes,
+            len(b"partial model"),
+        )
+        self.assertEqual(result.freed_bytes, 0)
+
+    def test_clear_model_qwen_mixed_complete_and_incomplete_assets_isolated(self) -> None:
+        qwen = build_model_inventory()[0]
+        aligner_strategy = FakeStrategy(23)
+        aligner_repository = FakeRepository(
+            qwen.assets[1].model_id,
+            ("aligner-a",),
+            aligner_strategy,
+        )
+        asr_repository = FakeRepository(
+            qwen.assets[0].model_id,
+            ("asr-a",),
+            FakeStrategy(31),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            cache_dir = Path(temporary)
+            selected = (
+                cache_dir
+                / "hub"
+                / "models--Qwen--Qwen3-ASR-1.7B"
+                / "blobs"
+                / "selected.incomplete"
+            )
+            unrelated = (
+                cache_dir
+                / "hub"
+                / "models--other--model"
+                / "blobs"
+                / "unrelated.incomplete"
+            )
+            selected.parent.mkdir(parents=True)
+            unrelated.parent.mkdir(parents=True)
+            selected.write_bytes(b"qwen partial")
+            unrelated.write_bytes(b"keep")
+            with (
+                patch(
+                    "huggingface_hub.scan_cache_dir",
+                    return_value=FakeCacheInfo(
+                        {asr_repository, aligner_repository},
+                        incomplete_files=(
+                            SimpleNamespace(
+                                file_path=selected,
+                                size_on_disk=selected.stat().st_size,
+                            ),
+                            SimpleNamespace(
+                                file_path=unrelated,
+                                size_on_disk=unrelated.stat().st_size,
+                            ),
+                        ),
+                    ),
+                ),
+                patch(
+                    "meeting_recording_processor.models.resolve_cached_model",
+                    return_value=ResolvedModel(
+                        qwen.assets[0].model_id,
+                        cache_dir / "hub" / "snapshot",
+                        "snapshot",
+                    ),
+                ),
+            ):
+                result = clear_model_set(qwen, cache_dir)
+
+            self.assertFalse(selected.exists())
+            self.assertTrue(unrelated.exists())
+
+        self.assertEqual(
+            result.expected_freed_bytes,
+            31 + 23 + len(b"qwen partial"),
+        )
+        self.assertEqual(aligner_repository.delete_calls, [("aligner-a",)])
+        self.assertEqual(aligner_strategy.execute_calls, 1)
+
+    def test_clear_model_partial_qwen_set_removes_aligner_and_asr_incomplete_file(self) -> None:
+        qwen = build_model_inventory()[0]
+        aligner_strategy = FakeStrategy(17)
+        aligner_repository = FakeRepository(
+            qwen.assets[1].model_id,
+            ("aligner-a",),
+            aligner_strategy,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            cache_dir = Path(temporary)
+            selected = (
+                cache_dir
+                / "hub"
+                / "models--Qwen--Qwen3-ASR-1.7B"
+                / "blobs"
+                / "asr.incomplete"
+            )
+            selected.parent.mkdir(parents=True)
+            selected.write_bytes(b"asr partial")
+            with (
+                patch(
+                    "huggingface_hub.scan_cache_dir",
+                    return_value=FakeCacheInfo(
+                        {aligner_repository},
+                        incomplete_files=(
+                            SimpleNamespace(
+                                file_path=selected,
+                                size_on_disk=selected.stat().st_size,
+                            ),
+                        ),
+                    ),
+                ),
+                patch(
+                    "meeting_recording_processor.models.resolve_cached_model",
+                    return_value=ResolvedModel(
+                        qwen.assets[1].model_id,
+                        cache_dir / "hub" / "snapshot",
+                        "snapshot",
+                    ),
+                ),
+            ):
+                result = clear_model_set(qwen, cache_dir)
+
+            self.assertFalse(selected.exists())
+
+        self.assertFalse(result.assets[0].cached)
+        self.assertEqual(result.assets[0].incomplete_file_count, 1)
+        self.assertTrue(result.assets[1].cached)
+        self.assertEqual(aligner_strategy.execute_calls, 1)
+        self.assertEqual(
+            result.expected_freed_bytes,
+            17 + len(b"asr partial"),
+        )
 
 
 if __name__ == "__main__":

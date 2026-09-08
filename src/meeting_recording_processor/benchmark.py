@@ -74,12 +74,44 @@ def backend_runtime_reason(model_set: AsrModelSet) -> str | None:
 
 
 def _missing_model_reason(status: ModelSetStatus) -> str:
-    model_ids = ", ".join(asset.model_id for asset in status.missing_assets)
-    return f"local model asset(s) missing: {model_ids}"
+    details = []
+    for asset_status in status.assets:
+        if asset_status.installed:
+            continue
+        state = (
+            "cached but incomplete or not offline-resolvable"
+            if asset_status.cached
+            else "missing"
+        )
+        details.append(f"{asset_status.asset.model_id} ({state})")
+    return "local model asset(s) unavailable: " + ", ".join(details)
 
 
 def _relative_output_path(path: Path, benchmark_dir: Path) -> str:
     return path.relative_to(benchmark_dir).as_posix()
+
+
+def _diagnostic_output_path(
+    diagnostic_path: object,
+    *,
+    benchmark_dir: Path,
+    backend_output_dir: Path,
+) -> str | None:
+    if diagnostic_path is None:
+        return None
+    try:
+        candidate = Path(diagnostic_path).expanduser().resolve()
+        benchmark_root = benchmark_dir.resolve()
+        backend_root = backend_output_dir.resolve()
+    except (OSError, RuntimeError, TypeError):
+        return None
+    if (
+        not candidate.is_file()
+        or not candidate.is_relative_to(benchmark_root)
+        or not candidate.is_relative_to(backend_root)
+    ):
+        return None
+    return _relative_output_path(candidate, benchmark_root)
 
 
 def _output_path(benchmark_dir: Path, model_set: AsrModelSet, input_path: Path) -> Path:
@@ -257,7 +289,21 @@ def run_benchmark(
                 output=_relative_output_path(extracted.output_path, benchmark_dir),
                 character_count=len(text),
             )
-        except (TranscriptionFailed, ProcessorError) as exc:
+        except TranscriptionFailed as exc:
+            elapsed_seconds = max(clock() - started, 0.0)
+            results_by_backend[model_set.backend] = _result(
+                model_set=model_set,
+                status="failed",
+                elapsed_seconds=elapsed_seconds,
+                input_duration_seconds=input_duration_seconds,
+                output=_diagnostic_output_path(
+                    exc.diagnostic_path,
+                    benchmark_dir=benchmark_dir,
+                    backend_output_dir=output_path.parent,
+                ),
+                reason=str(exc),
+            )
+        except ProcessorError as exc:
             elapsed_seconds = max(clock() - started, 0.0)
             results_by_backend[model_set.backend] = _result(
                 model_set=model_set,
