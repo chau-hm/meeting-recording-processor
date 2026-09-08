@@ -7,8 +7,10 @@ import json
 from pathlib import Path
 import sys
 
+from .benchmark import render_summary, run_benchmark
 from .config import (
     AsrMode,
+    BenchmarkConfig,
     DEFAULT_QWEN_ALIGNER_MODEL,
     DEFAULT_QWEN_MODEL,
     DEFAULT_SENSEVOICE_MODEL,
@@ -21,7 +23,14 @@ from .config import (
 )
 from .diagnostics import doctor_report
 from .errors import ConfigurationError, ProcessorError, TranscriptionFailed
-from .models import directory_size, download_model, human_size
+from .models import (
+    build_model_inventory,
+    clear_model_set,
+    directory_size,
+    download_model,
+    human_size,
+    select_model_sets,
+)
 from .outputs import export_transcript
 from .pipeline import extract
 from .progress import ProgressMode, resolve_progress_mode
@@ -43,10 +52,7 @@ def _add_transcription_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--work-dir", type=Path)
     parser.add_argument("--cache-dir", type=Path)
-    parser.add_argument("--qwen-model", default=DEFAULT_QWEN_MODEL)
-    parser.add_argument("--qwen-aligner-model", default=DEFAULT_QWEN_ALIGNER_MODEL)
-    parser.add_argument("--sensevoice-model", default=DEFAULT_SENSEVOICE_MODEL)
-    parser.add_argument("--vibevoice-model", default=DEFAULT_VIBEVOICE_MODEL)
+    _add_model_overrides(parser)
     parser.add_argument(
         "--vibevoice-acoustic-chunk-size",
         type=int,
@@ -62,6 +68,13 @@ def _add_transcription_options(parser: argparse.ArgumentParser) -> None:
         choices=[mode.value for mode in ProgressMode],
         help="進度輸出：auto（預設）、on 或 off；亦可用 ASR_PROGRESS",
     )
+
+
+def _add_model_overrides(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--qwen-model", default=DEFAULT_QWEN_MODEL)
+    parser.add_argument("--qwen-aligner-model", default=DEFAULT_QWEN_ALIGNER_MODEL)
+    parser.add_argument("--sensevoice-model", default=DEFAULT_SENSEVOICE_MODEL)
+    parser.add_argument("--vibevoice-model", default=DEFAULT_VIBEVOICE_MODEL)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -96,6 +109,8 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser.add_argument("--cache-dir", type=Path)
     doctor_parser.add_argument("--qwen-model", default=DEFAULT_QWEN_MODEL)
     doctor_parser.add_argument("--qwen-aligner-model", default=DEFAULT_QWEN_ALIGNER_MODEL)
+    doctor_parser.add_argument("--sensevoice-model", default=DEFAULT_SENSEVOICE_MODEL)
+    doctor_parser.add_argument("--vibevoice-model", default=DEFAULT_VIBEVOICE_MODEL)
     doctor_parser.add_argument("--json", action="store_true", dest="as_json")
 
     download_parser = subparsers.add_parser(
@@ -107,10 +122,47 @@ def build_parser() -> argparse.ArgumentParser:
         default="all",
     )
     download_parser.add_argument("--cache-dir", type=Path)
-    download_parser.add_argument("--qwen-model", default=DEFAULT_QWEN_MODEL)
-    download_parser.add_argument("--qwen-aligner-model", default=DEFAULT_QWEN_ALIGNER_MODEL)
-    download_parser.add_argument("--sensevoice-model", default=DEFAULT_SENSEVOICE_MODEL)
-    download_parser.add_argument("--vibevoice-model", default=DEFAULT_VIBEVOICE_MODEL)
+    _add_model_overrides(download_parser)
+
+    clear_parser = subparsers.add_parser(
+        "clear-model",
+        help="移除指定本機 ASR model cache；唔會刪 input 或 output",
+    )
+    clear_parser.add_argument(
+        "--asr",
+        choices=["qwen3", "sensevoice", "vibevoice", "all"],
+        required=True,
+    )
+    clear_parser.add_argument("--cache-dir", type=Path)
+    _add_model_overrides(clear_parser)
+    clear_parser.add_argument("--dry-run", action="store_true")
+
+    benchmark_parser = subparsers.add_parser(
+        "benchmark",
+        help="逐一比較本機已安裝嘅 ASR backend；永遠唔下載 model",
+    )
+    benchmark_parser.add_argument("input", type=Path)
+    benchmark_parser.add_argument("--language", default="Cantonese")
+    benchmark_parser.add_argument("--context-file", type=Path)
+    benchmark_parser.add_argument("--output-dir", type=Path)
+    benchmark_parser.add_argument("--work-dir", type=Path)
+    benchmark_parser.add_argument("--cache-dir", type=Path)
+    _add_model_overrides(benchmark_parser)
+    benchmark_parser.add_argument(
+        "--vibevoice-acoustic-chunk-size",
+        type=int,
+        default=DEFAULT_VIBEVOICE_ACOUSTIC_CHUNK_SIZE,
+        help="VibeVoice acoustic tokenizer chunk size in 24 kHz samples",
+    )
+    benchmark_parser.add_argument("--include-experimental", action="store_true")
+    benchmark_parser.add_argument("--overwrite", action="store_true")
+    benchmark_parser.add_argument("--verbose", action="store_true")
+    benchmark_parser.add_argument(
+        "--progress",
+        dest="progress_mode",
+        choices=[mode.value for mode in ProgressMode],
+        help="進度輸出：auto（預設）、on 或 off；亦可用 ASR_PROGRESS",
+    )
 
     cache_parser = subparsers.add_parser("cache-size", help="顯示 project-local model cache 大小")
     cache_parser.add_argument("--cache-dir", type=Path)
@@ -276,6 +328,8 @@ def _run_doctor(args: argparse.Namespace) -> int:
         cache_dir,
         qwen_model=args.qwen_model,
         qwen_aligner_model=args.qwen_aligner_model,
+        sensevoice_model=args.sensevoice_model,
+        vibevoice_model=args.vibevoice_model,
     )
     if args.as_json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -308,20 +362,77 @@ def _run_download(args: argparse.Namespace) -> int:
     require_apple_silicon()
     root = project_root()
     cache_dir = (args.cache_dir or root / ".cache/huggingface").expanduser()
-    targets: list[tuple[str, str]] = []
-    if args.asr in {"qwen3", "all"}:
-        targets.append(("qwen3", args.qwen_model))
-        targets.append(("qwen3-aligner", args.qwen_aligner_model))
-    if args.asr in {"sensevoice", "all"}:
-        targets.append(("sensevoice", args.sensevoice_model))
-    if args.asr in {"vibevoice", "all"}:
-        targets.append(("vibevoice", args.vibevoice_model))
-    for backend, model_id in targets:
-        print(f"下載 {backend}：{model_id}")
-        resolved = download_model(model_id, cache_dir)
-        print(f"完成；snapshot：{resolved.snapshot or 'unknown'}")
+    inventory = build_model_inventory(
+        qwen_model=args.qwen_model,
+        qwen_aligner_model=args.qwen_aligner_model,
+        sensevoice_model=args.sensevoice_model,
+        vibevoice_model=args.vibevoice_model,
+    )
+    for model_set in select_model_sets(inventory, args.asr):
+        for asset in model_set.assets:
+            print(f"下載 {asset.name}：{asset.model_id}")
+            resolved = download_model(asset.model_id, cache_dir)
+            print(f"完成；snapshot：{resolved.snapshot or 'unknown'}")
     print(f"Cache 大小：{human_size(directory_size(cache_dir))}")
     return 0
+
+
+def _run_clear_model(args: argparse.Namespace) -> int:
+    root = project_root()
+    cache_dir = (args.cache_dir or root / ".cache/huggingface").expanduser()
+    inventory = build_model_inventory(
+        qwen_model=args.qwen_model,
+        qwen_aligner_model=args.qwen_aligner_model,
+        sensevoice_model=args.sensevoice_model,
+        vibevoice_model=args.vibevoice_model,
+    )
+    model_sets = select_model_sets(inventory, args.asr)
+    for index, model_set in enumerate(model_sets):
+        if index:
+            print()
+        result = clear_model_set(model_set, cache_dir, dry_run=args.dry_run)
+        print(f"Model set: {model_set.backend}")
+        print()
+        for asset in result.assets:
+            state = "yes" if asset.installed else "no"
+            print(f"{asset.asset.model_id}\n  installed: {state}")
+        print()
+        print(f"Will free: {human_size(result.expected_freed_bytes)}")
+        if args.dry_run:
+            print("No files deleted (--dry-run).")
+        else:
+            print(f"Cleared model set: {model_set.backend}")
+            print(f"Freed: {human_size(result.freed_bytes)}")
+            print(f"Remaining cache: {human_size(result.after_cache_size)}")
+            print()
+            print("Restore with:")
+            print(f"  uv run mrp download-model --asr {args.asr}")
+    return 0
+
+
+def _run_benchmark(args: argparse.Namespace) -> int:
+    output_dir, work_dir, cache_dir, context_file = _paths(args)
+    result = run_benchmark(
+        BenchmarkConfig(
+            input_path=args.input,
+            output_dir=output_dir,
+            work_dir=work_dir,
+            cache_dir=cache_dir,
+            language=args.language,
+            context_file=context_file,
+            qwen_model=args.qwen_model,
+            qwen_aligner_model=args.qwen_aligner_model,
+            sensevoice_model=args.sensevoice_model,
+            vibevoice_model=args.vibevoice_model,
+            vibevoice_acoustic_chunk_size=args.vibevoice_acoustic_chunk_size,
+            include_experimental=args.include_experimental,
+            overwrite=args.overwrite,
+            verbose=args.verbose,
+            progress_mode=args.progress_mode,
+        )
+    )
+    print(render_summary(result))
+    return 0 if result.passed_count else 1
 
 
 def _run_cache_size(args: argparse.Namespace) -> int:
@@ -345,6 +456,10 @@ def main(argv: list[str] | None = None) -> int:
             return _run_doctor(args)
         if args.command == "download-model":
             return _run_download(args)
+        if args.command == "clear-model":
+            return _run_clear_model(args)
+        if args.command == "benchmark":
+            return _run_benchmark(args)
         if args.command == "cache-size":
             return _run_cache_size(args)
         parser.error(f"未知 command：{args.command}")

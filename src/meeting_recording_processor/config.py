@@ -83,6 +83,32 @@ class ExtractConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class BenchmarkConfig:
+    input_path: Path
+    output_dir: Path
+    work_dir: Path
+    cache_dir: Path
+    language: str = "Cantonese"
+    context_file: Path | None = None
+    qwen_model: str = DEFAULT_QWEN_MODEL
+    qwen_aligner_model: str = DEFAULT_QWEN_ALIGNER_MODEL
+    sensevoice_model: str = DEFAULT_SENSEVOICE_MODEL
+    vibevoice_model: str = DEFAULT_VIBEVOICE_MODEL
+    vibevoice_acoustic_chunk_size: int = DEFAULT_VIBEVOICE_ACOUSTIC_CHUNK_SIZE
+    include_experimental: bool = False
+    overwrite: bool = False
+    verbose: bool = False
+    progress_mode: str | None = None
+
+    def __post_init__(self) -> None:
+        validate_vibevoice_acoustic_chunk_size(self.vibevoice_acoustic_chunk_size)
+
+    @property
+    def benchmark_dir(self) -> Path:
+        return self.output_dir / "benchmark" / self.input_path.stem
+
+
+@dataclass(frozen=True, slots=True)
 class ExportConfig:
     transcript_path: Path
     output_dir: Path | None = None

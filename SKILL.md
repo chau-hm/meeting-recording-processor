@@ -15,7 +15,19 @@ description: Locally extract Cantonese-heavy meeting audio or video to a canonic
 2. 必須係 macOS Apple Silicon arm64，並已安裝 `uv`、`ffmpeg`、`ffprobe`。
 3. 先執行 `uv run mrp doctor`。缺少 model 時，向使用者說明並明確執行 `uv run mrp download-model --asr all`；Qwen3 timestamp path 需要 ASR model 同 forced aligner，`download-model --asr qwen3` 會下載完整 set。下載係唯一可連網步驟。VibeVoice 係大型 model，並要求 Apple Silicon MPS。
 `doctor` 會分開檢查 `model:qwen3`、`model:qwen3-aligner`、package presence 同 `runtime:vibevoice-mps` readiness；MPS unavailable 或任一 Qwen asset 缺失時唔好開始相應 extract。
-4. 唔可以 upload media、transcript 或 context，亦唔可以改用 cloud ASR。
+
+4. 如要釋放 model cache 空間，只執行明確指定嘅 model set：
+
+```bash
+uv run mrp clear-model --asr vibevoice
+uv run mrp clear-model --asr qwen3 --dry-run
+```
+
+`clear-model` 只會刪 configured Hugging Face cache 內所選 repository 嘅 revisions，
+唔會刪 input、output、work、`.venv` 或其他 models；Qwen3 會同時處理 ASR 同 forced
+aligner。之後可用 `uv run mrp download-model --asr <model-set>` 還原；model
+download 仍然係唯一可連網步驟，例如 `uv run mrp download-model --asr vibevoice`。
+5. 唔可以 upload media、transcript 或 context，亦唔可以改用 cloud ASR。
 
 ## Step 1 — Extract
 
@@ -62,6 +74,21 @@ uv run mrp batch <input-directory> --asr auto
 ```
 
 Batch 會按檔名排序，逐一產生 `<input-stem>.transcript.json`，並喺進度輸出顯示 `File N of M`。開始第一個 transcription 前，程式會先計算全部 destinations；同 stem 或 macOS case-insensitive 等價 destination 嘅 input 會 fail closed。`--overwrite` 只授權取代已存在嘅精確 destination，唔會放寬同一 batch 內嘅 collision。
+
+如要比較本機已安裝嘅 ASR backend，執行：
+
+```bash
+uv run mrp benchmark meeting.mp4
+uv run mrp benchmark meeting.mp4 --include-experimental
+```
+
+Benchmark 預設只會 sequentially 嘗試完整 installed 嘅 Qwen3 同 SenseVoice，
+每個 backend 都係 explicit extraction，唔使用 `auto`，亦永遠唔下載 model。Qwen3
+缺少 ASR 或 forced aligner、SenseVoice 缺少 model、或 runtime prerequisite
+不可用時會 `skipped`；VibeVoice 係 experimental，只有 `--include-experimental`
+先 eligible。輸出會隔離喺 `output/benchmark/<input-stem>/<backend>/`，並寫
+`benchmark.json`。Runtime／RTF 只代表 performance，唔係 accuracy；冇 reference
+transcript 時唔會推算 WER/CER。至少一個 backend 成功時 return 0，否則 return 1。
 
 ## Step 2 — Export（只在明確要求時）
 

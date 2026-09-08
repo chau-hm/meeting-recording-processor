@@ -63,6 +63,38 @@ class CliTests(unittest.TestCase):
         self.assertEqual(vibevoice.asr, "vibevoice")
         self.assertEqual(all_models.asr, "all")
 
+    def test_clear_model_requires_explicit_asr_and_supports_dry_run(self) -> None:
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(["clear-model"])
+        args = build_parser().parse_args(
+            [
+                "clear-model",
+                "--asr",
+                "qwen3",
+                "--dry-run",
+                "--qwen-model",
+                "local/qwen",
+            ]
+        )
+        self.assertEqual(args.asr, "qwen3")
+        self.assertTrue(args.dry_run)
+        self.assertEqual(args.qwen_model, "local/qwen")
+
+    def test_benchmark_parser_is_explicitly_not_an_asr_mode(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "benchmark",
+                "meeting.mp4",
+                "--include-experimental",
+                "--progress",
+                "off",
+            ]
+        )
+        self.assertEqual(args.command, "benchmark")
+        self.assertEqual(args.input, Path("meeting.mp4"))
+        self.assertTrue(args.include_experimental)
+        self.assertEqual(args.progress_mode, "off")
+
     def test_download_all_includes_vibevoice(self) -> None:
         args = build_parser().parse_args(["download-model", "--asr", "all"])
         downloaded: list[tuple[str, Path]] = []

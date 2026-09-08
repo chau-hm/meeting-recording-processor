@@ -64,6 +64,13 @@ Qwen3 attempt 符合任一條件時，`auto` 先執行 SenseVoice：
 - 只有 `download-model` command 可啟用 network 下載。
 - 預設 cache 為 `<project>/.cache/huggingface/`；cache path 同 snapshot id 寫入 provenance。
 - VibeVoice 使用 native Transformers API，extract 只會由已 resolve 嘅 local snapshot 建立 processor/model。
+- `clear-model` 只可清理明確指定嘅 `qwen3`、`sensevoice`、`vibevoice` 或 `all` model
+  set；預設唔會清理。Qwen3 model set 必須同時包括 ASR repository 同 forced aligner
+  repository，clear 時兩者都會處理。
+- `clear-model --dry-run` 只掃描指定 Hugging Face cache、顯示每個 asset 是否已安裝同
+  預計釋放空間，絕不執行 deletion。實際清理只會使用 cache API 移除所選 repository
+  嘅全部 cached revisions，唔會觸碰 input、output、work、`.venv` 或其他 repository；
+  `download-model` 可以重新建立已刪除 assets。
 
 ### FR-06 Text policy
 
@@ -136,6 +143,28 @@ JSON 包含 source metadata/hash、request、immutable attempts、selected attem
 - work file 預設只清理本 run directory；`--keep-work-files` 先保留 normalized WAV。
 - Ctrl-C return code 130；configuration/media/model/schema errors return code 1。
 
+### FR-10 Model lifecycle and local benchmark
+
+- `benchmark INPUT` 只使用已完整存在於 configured local cache 嘅 model set；唔可以呼叫
+  `download-model` 或以 network-enabled mode resolve model。Qwen3 只有 ASR + forced
+  aligner 兩個 repository 都存在時先算 installed。
+- 預設 candidate 順序係 `qwen3`、`sensevoice`；VibeVoice 只會喺
+  `--include-experimental` opt-in 後 eligibility check。Missing model asset 或 runtime
+  prerequisite 記錄為 `skipped`，唔會令其他 backend 停止。
+- 每個 candidate 都以 explicit `extract` backend mode 順序執行，唔使用 `auto`、唔觸發
+  Qwen3 → SenseVoice fallback。單一 backend transcription failure 記錄為 `failed`，
+  之後繼續下一個 backend。
+- Output 目錄為 `<output-dir>/benchmark/<input-stem>/<backend>/`，每個 transcript
+  destination 同 `benchmark.json` 預設 fail-on-collision；只可由 `--overwrite` 明確授權
+  取代 exact destination。Benchmark 保留 canonical transcript JSON contract，並喺
+  `benchmark.json` 按 `qwen3`、`sensevoice`、`vibevoice` 順序寫出 model identity、
+  status、elapsed seconds、input duration/RTF（如可用）、canonical character count、
+  relative output path 同 skip/failure reason。
+- Benchmark summary 嘅 runtime/RTF 只係 performance data，唔係 accuracy；冇 reference
+  transcript 時唔計 WER、CER 或 benchmark winner。至少一個 backend `passed` 且 report
+  成功寫出時 return `0`；全部 backend 都 `failed`／`skipped` 時 return `1`。Benchmark
+  orchestration／report write failure 同樣 return non-zero。
+
 ## 3. CLI contract
 
 ```text
@@ -163,8 +192,12 @@ mrp export TRANSCRIPT_JSON
   [--output-dir PATH]
   [--overwrite]
 
-mrp doctor [--cache-dir PATH] [--qwen-model MODEL_ID] [--qwen-aligner-model MODEL_ID] [--json]
+mrp doctor [--cache-dir PATH] [model overrides] [--json]
 mrp download-model [--asr qwen3|sensevoice|vibevoice|all] [model/cache overrides]
+mrp clear-model --asr qwen3|sensevoice|vibevoice|all [model/cache overrides] [--dry-run]
+mrp benchmark INPUT [--language VALUE] [--context-file PATH] [--output-dir PATH]
+  [--work-dir PATH] [--cache-dir PATH] [model overrides]
+  [--progress auto|on|off] [--include-experimental] [--overwrite]
 mrp cache-size [--cache-dir PATH]
 ```
 
@@ -218,7 +251,8 @@ backend timing。
 
 ## 6. Acceptance status
 
-- [x] 完整 canonical CLI：`extract`／`export`／`doctor`／model/cache commands。
+- [x] 完整 canonical CLI：`extract`／`export`／`doctor`／`download-model`／`clear-model`／
+  `benchmark`／`cache-size`。
 - [x] input validation、ffprobe、explicit stream selection、Qwen3/SenseVoice 16 kHz mono normalization。
 - [x] Qwen3 同 SenseVoice adapter；backend lazy load。
 - [x] `auto` 客觀 hard-failure routing；明確 mode 無 silent fallback。
@@ -230,6 +264,8 @@ backend timing。
 - [x] TTY/plain progress、indeterminate fallback、batch file reporting 同 failure cleanup。
 - [x] shell wrappers、baseline preservation、完整文件同 JSON Schema。
 - [x] VibeVoice explicit backend、native Transformers model management、24 kHz media path、FP32 MPS contract、all-or-nothing structured timing、language provenance、MPS doctor readiness 同 model-free tests。
+- [x] Typed ASR model inventory、Qwen3 complete-set cache clearing、dry-run safety、offline
+  sequential benchmark with isolated outputs, report metrics, and deterministic exit semantics.
 - [ ] Apple Silicon 實機下載兩個 models 並完成真實 M4A/MP3/WAV/FLAC/MP4/MOV smoke test。
 - [ ] Apple Silicon 實機下載 VibeVoice、MPS offline inference 同 structured speaker/timestamp smoke test。
 - [ ] Apple Silicon 上產生／驗證 `uv.lock` 同量度 cache/runtime disk usage。

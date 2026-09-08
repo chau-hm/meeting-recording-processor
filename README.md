@@ -116,9 +116,68 @@ uv run mrp cache-size
 `doctor` 會將 `model:qwen3` 同 `model:qwen3-aligner` 分開列出，亦會將
 `torch`／`transformers` package presence 同 `runtime:vibevoice-mps` 分開列出；
 package 裝咗唔代表 MPS 可用，MPS unavailable 或 Qwen 任一 asset 缺失時整體 `healthy`
-會係 false。使用自訂 Qwen asset IDs 時，`doctor` 同 `extract`／`download-model` 一樣可用
-`--qwen-model` 同 `--qwen-aligner-model`。
+會係 false。使用自訂 model IDs 時，`doctor` 同 `extract`／`download-model` 一樣可用
+`--qwen-model`、`--qwen-aligner-model`、`--sensevoice-model` 同 `--vibevoice-model`。
 預設 context 係 `profiles/generic.txt`。LOQ vocabulary 只係 opt-in example，核心程式冇 hard-code domain data。
+
+### Model cache lifecycle
+
+`download-model` 係唯一會連網嘅 model command；刪除後可以隨時重新下載相同
+model set：
+
+```bash
+# 只移除 VibeVoice，唔會刪 input、output、work 或其他 Hugging Face model
+uv run mrp clear-model --asr vibevoice
+
+# 先預覽 Qwen3 ASR + forced aligner 會釋放幾多空間
+uv run mrp clear-model --asr qwen3 --dry-run
+
+# 之後還原完整 Qwen3 model set
+uv run mrp download-model --asr qwen3
+
+# 或者還原 VibeVoice
+uv run mrp download-model --asr vibevoice
+```
+
+`clear-model` 必須明確指定 `--asr qwen3|sensevoice|vibevoice|all`，預設唔會
+清理任何 model。Qwen3 係一個 ASR + forced aligner model set；即使其中一個
+asset 已經缺失，清理仍會移除另一個並報告各 asset 狀態。清理只會透過
+Hugging Face cache API 移除所選 repository 嘅 cached revisions。
+
+### Local ASR benchmark
+
+Benchmark 逐一重用正常 `extract` pipeline，並將每個 backend 寫入獨立目錄：
+
+```bash
+uv run mrp benchmark meeting.mp4
+uv run mrp benchmark meeting.mp4 --include-experimental
+```
+
+預設只會嘗試本機已完整安裝、runtime 可用嘅 Qwen3 同 SenseVoice；Qwen3
+必須同時有 ASR model 同 forced aligner。缺少 model 或 runtime 會記錄為
+`skipped`，唔會觸發下載。VibeVoice 係 experimental，只有
+`--include-experimental` 先會考慮，而且未 cache 或 runtime 未 ready 時會
+skip。每個 backend 都用 explicit mode 執行，Qwen3 失敗唔會喺 benchmark
+結果內靜默 fallback 到 SenseVoice；inference 會順序執行，唔會平行佔用 MPS。
+
+Default layout：
+
+```text
+output/
+└── benchmark/
+    └── meeting/
+        ├── qwen3/meeting.transcript.json
+        ├── sensevoice/meeting.transcript.json
+        └── benchmark.json
+```
+
+`benchmark.json` 會保存 model/model-set identity、status、runtime、
+input duration、RTF、canonical transcript character count、output relative
+path 同 failure/skip reason。runtime 同 RTF 係 performance data，唔係
+transcription accuracy；冇 reference transcript 就唔會計 WER、CER 或 winner。
+Benchmark 亦永遠唔會下載 model，existing output 預設 fail，只有明確加
+`--overwrite` 先會取代 exact benchmark destinations。至少一個 backend
+成功時 command return `0`；全部 backend 都 skipped/failed 時 return `1`。
 
 ## 轉錄進度
 
