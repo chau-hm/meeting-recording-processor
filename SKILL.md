@@ -28,7 +28,13 @@ uv run mrp extract <input> --asr auto
 必要時可以加入 `--context-file`、`--output-dir`、`--work-dir`、`--cache-dir` 或 `--progress auto|on|off`。亦可以用 `ASR_PROGRESS=auto|on|off` 控制進度輸出。預設 `auto` 先 Qwen3，只喺客觀 hard failure fallback SenseVoice：backend exception、空白、Unicode 標點／符號比例超過 90%，或至少 10 秒 active audio 但少過 3 個 substantive 字元。
 如要明確評估 VibeVoice，使用 `uv run mrp extract <input> --asr vibevoice`。VibeVoice 輸入係 24 kHz、現時 MPS path 使用 FP32、最多單次 60 分鐘；預設 `acoustic_tokenizer_chunk_size` 係 64000 samples，可用 `--vibevoice-acoustic-chunk-size` 調整（正整數、3200 倍數）。較細 chunk 只降低 tokenizer peak memory，唔保證長錄音一定 fit unified memory；project 唔會停用 PyTorch MPS high-watermark protection。`--language` 只保留喺 request／attempt metadata，canonical transcript language 係 `und`，因為 backend 未提供 verified language detection。完整 speaker/timestamp structured output 會保留喺 attempt metadata，但 canonical schema 暫時唔啟用 diarization。
 
-一般專有名詞、accuracy、punctuation 或 segmentation 問題唔可以觸發自動 fallback。使用者如要求人工重試，另行執行 `--asr sensevoice` 並使用另一 output directory，避免覆蓋第一次 JSON。
+一般專有名詞、accuracy、punctuation 或 segmentation 問題唔可以觸發自動 fallback。Qwen raw
+backend timing 同 canonical timing 分開保存：zero-duration word 只會 deterministic repair
+canonical copy；negative、non-finite、backwards 或 malformed timing 會整組放棄 word-level
+timing，改用 valid chunk timing 或總時長估算，唔會因 timing defect 觸發 SenseVoice fallback。
+SenseVoice 固定用 30 秒 chunk、Cantonese → `yue`，只提供 coarse chunk timing；較後 chunk
+失敗時 diagnostic 會保留 completed chunk metadata，但 partial output 唔會當成功。使用者如要求
+人工重試，另行執行 `--asr sensevoice` 並使用另一 output directory，避免覆蓋第一次 JSON。
 
 如果 `auto` 因客觀 hard failure fallback，進度會先顯示 `fallback` transition 同下一個 model loading，之後由新 backend 重新顯示自己嘅 `transcribing` progress；唔會將 model loading 假裝成 transcription，亦唔會沿用上一個 backend 嘅 percentage。
 
@@ -72,7 +78,9 @@ uv run mrp export <input-stem>.transcript.json
 ## Failure handling
 
 - 指定 `--asr qwen3`、`--asr sensevoice` 或 `--asr vibevoice` 時，唔可以靜默換 backend；VibeVoice 失敗時唔會 fallback 到其他 backend。
-- 所有 attempt 失敗時，保留 `status: failed` diagnostic JSON，報告非零狀態並停止。
+- 所有 attempt 失敗時，保留 `status: failed` diagnostic JSON，報告非零狀態並停止；人類可讀
+  錯誤會包括最具體嘅 backend/model/chunk reason，machine-readable `error` 仍可為
+  `all_asr_attempts_failed`。
 - output 已存在時，預設拒絕覆蓋。只喺使用者明確授權取代該精確檔案先用 `--overwrite`。
 - 唔刪 input。Work cleanup 只可由程式清理本次 run 建立嘅 scoped directory。
 

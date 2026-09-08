@@ -25,7 +25,11 @@ from meeting_recording_processor.pipeline import Extractor
 from meeting_recording_processor.postprocess import postprocess_result
 from meeting_recording_processor.progress import ProgressEvent, ProgressPhase, ProgressReporter
 from meeting_recording_processor.schema_io import load_package
-from meeting_recording_processor.schemas import BackendResult, TranscriptSegment
+from meeting_recording_processor.schemas import (
+    BackendResult,
+    RawTranscriptSegment,
+    TranscriptSegment,
+)
 
 
 class FakeBackend:
@@ -179,6 +183,83 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(sensevoice.calls, 0)
         self.assertEqual(self.normalization_rates, [16000])
 
+    def test_qwen_zero_duration_raw_timing_does_not_block_package_write(self) -> None:
+        qwen = FakeBackend(
+            BackendResult(
+                language="Cantonese",
+                backend="qwen3",
+                model="test/qwen3",
+                text="我哋今日開始開會。",
+                segments=(
+                    TranscriptSegment(0.0, 0.5, "我哋"),
+                    TranscriptSegment(0.5, 0.5, "今日"),
+                    TranscriptSegment(0.5, 0.9, "開始開會。"),
+                ),
+            )
+        )
+        sensevoice = FakeBackend(result("sensevoice", "不應執行。"))
+
+        extracted = self.extractor({"qwen3": qwen, "sensevoice": sensevoice}).extract(
+            self.config()
+        )
+
+        package = load_package(extracted.output_path, require_completed=True)
+        self.assertEqual(extracted.selected_backend, "qwen3")
+        self.assertEqual(sensevoice.calls, 0)
+        self.assertEqual(
+            package["attempts"][0]["raw_segments"][1]["start"],
+            0.5,
+        )
+        self.assertEqual(package["attempts"][0]["raw_segments"][1]["end"], 0.5)
+        self.assertTrue(
+            all(
+                segment["end"] > segment["start"]
+                for segment in package["transcript"]["segments"]
+            )
+        )
+
+    def test_qwen_invalid_word_timing_uses_chunk_estimation_without_fallback(self) -> None:
+        qwen = FakeBackend(
+            BackendResult(
+                language="Cantonese",
+                backend="qwen3",
+                model="test/qwen3",
+                text="完整 transcript。",
+                segments=(
+                    TranscriptSegment(0.0, 1.0, "完整 transcript。", "chunk"),
+                ),
+                raw_segments=(
+                    RawTranscriptSegment(0.0, 0.5, "第一"),
+                    RawTranscriptSegment(0.8, 1.0, "第二"),
+                    RawTranscriptSegment(0.6, 0.9, "第三"),
+                ),
+                metadata={
+                    "timestamp_source": "chunk",
+                    "word_timing_rejected": True,
+                },
+                warnings=("Qwen3 model word timing 已整體拒絕",),
+            )
+        )
+        sensevoice = FakeBackend(result("sensevoice", "不應執行。"))
+
+        extracted = self.extractor({"qwen3": qwen, "sensevoice": sensevoice}).extract(
+            self.config()
+        )
+
+        package = load_package(extracted.output_path, require_completed=True)
+        self.assertEqual(extracted.selected_backend, "qwen3")
+        self.assertEqual(sensevoice.calls, 0)
+        self.assertEqual(
+            [item["start"] for item in package["attempts"][0]["raw_segments"]],
+            [0.0, 0.8, 0.6],
+        )
+        self.assertTrue(
+            all(
+                item["timing_source"] == "estimated_from_chunk"
+                for item in package["transcript"]["segments"]
+            )
+        )
+
     def test_auto_falls_back_on_punctuation_collapse(self) -> None:
         qwen = FakeBackend(result("qwen3", "!!!!!!!!!!"))
         sensevoice = FakeBackend(result("sensevoice", "我哋今日開始開會。"))
@@ -206,6 +287,19 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(sensevoice.calls, 0)
         package = load_package(caught.exception.diagnostic_path)
         self.assertEqual(package["status"], "failed")
+
+    def test_explicit_backend_failure_surfaces_specific_reason(self) -> None:
+        sensevoice = FakeBackend(
+            BackendError("SenseVoice 第 4 段轉錄失敗：model crashed")
+        )
+        with self.assertRaises(TranscriptionFailed) as caught:
+            self.extractor({"sensevoice": sensevoice}).extract(
+                self.config(AsrMode.SENSEVOICE)
+            )
+
+        self.assertIn("model crashed", str(caught.exception))
+        package = load_package(caught.exception.diagnostic_path)
+        self.assertEqual(package["error"], "all_asr_attempts_failed")
 
     def test_missing_qwen_aligner_fails_before_backend_inference(self) -> None:
         qwen = FakeBackend(result("qwen3", "不應執行。"))

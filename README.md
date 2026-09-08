@@ -171,7 +171,7 @@ Fallback 例子：
 - 非空白字元超過 90% 係 Unicode 標點或符號；
 - active audio 至少 10 秒，但 substantive 字元少過 3 個。
 
-一般專有名詞、accuracy、標點或分段質素問題唔會自動 fallback。每個 attempt 嘅 raw text、raw segments、model snapshot、quality report、錯誤同 runtime 都保留喺同一 transcript JSON，唔會融合或覆蓋。Qwen attempt 另外保留 `aligner_model` 同 `aligner_snapshot`；VibeVoice failure 會先保存 device、dtype、runtime versions、audio duration、chunk size 同可用嘅 numeric MPS memory diagnostics。
+一般專有名詞、accuracy、標點或分段質素問題唔會自動 fallback。每個 attempt 嘅 raw text、raw timing、model snapshot、quality report、錯誤同 runtime 都保留喺同一 transcript JSON，唔會融合或覆蓋。Raw backend timing 同 canonical transcript timing 係兩個不同 contract：Qwen zero-duration word timing 只會喺 canonical timing 做 deterministic 0.001 秒修復，原值仍然保留；negative、non-finite、backwards 或 malformed word timing 會整組拒絕，改用已驗證 chunk timing，否則按音訊總時長估算。Timing defect 本身唔係 text-quality hard failure，唔會令 `auto` 改用 SenseVoice。Qwen attempt 另外保留 `aligner_model` 同 `aligner_snapshot`；VibeVoice failure 會先保存 device、dtype、runtime versions、audio duration、chunk size 同可用嘅 numeric MPS memory diagnostics。
 明確 `--asr vibevoice` 只執行 VibeVoice；失敗會寫出 diagnostic JSON，絕不靜默改用 Qwen3 或 SenseVoice。
 
 ## Output contract
@@ -192,13 +192,21 @@ output/
 └── meeting.srt
 ```
 
-Qwen3 同 VibeVoice 原生 model timestamps 會標記為 `timing_source: "model"`。VibeVoice 只會喺
+Qwen3 同 VibeVoice 原生 model timestamps 會標記為 `timing_source: "model"`。Qwen3
+model word timing 如果出現 zero-duration，canonical path 會保留文字並將該 cue 延長至最少
+0.001 秒；原始 `attempts[].raw_segments` 不會被改寫。Serious word-timing defect 會放棄
+整組 word timing，優先使用通過 validation 嘅 Qwen chunk timing，否則使用
+`estimated_from_duration`。VibeVoice 只會喺
 完整 structured result 通過 validation 時使用 model timing；任何 malformed／incomplete record
 都會令該 attempt 完全放棄 model timing，保留完整 text 並由 project 嘅 estimated timing path
 處理。VibeVoice 嘅 speaker id、raw structured output 同 parse diagnostics 只保留喺 attempt metadata，
 唔會改 canonical schema。
-SenseVoiceSmall 冇 word-level timestamps，本程式會先保留 30 秒 chunk timing，再按文字長度建立 cue；
-JSON 會標記 `timing_source: "estimated_from_chunk"` 並加入 warning。
+SenseVoiceSmall 冇 word-level timestamps，本程式固定以 30 秒 chunk inference，Cantonese
+映射成 pinned runtime 支援嘅 `yue`，先保留 chunk metadata，再按文字長度建立 cue；JSON
+會標記 `timing_source: "estimated_from_chunk"` 並加入 warning。長錄音如較後 chunk 失敗，
+diagnostic JSON 會保留已完成 chunk 數量、processed seconds、失敗 index 同已完成 chunk metadata；
+partial SenseVoice text 唔會當成成功 transcript。SenseVoice pinned API 未驗證支援 context
+hotwords；如有 `--context-file`，只會保留設定 provenance 並發出 warning，唔會注入 model。
 
 如所有 attempts 都失敗，`extract` 仍會原子寫出 `status: "failed"` 嘅 diagnostic JSON，再以非零 exit code 停止。`export` 拒絕處理 failed JSON。
 

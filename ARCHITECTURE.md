@@ -70,8 +70,8 @@ stateDiagram-v2
 | `media/normalize.py` | ffmpeg stream map、backend-specific PCM WAV | 不改 input |
 | `media/signal.py` | duration/RMS/active-audio stats | 不評主觀準確度 |
 | `models.py` | explicit download、offline snapshot resolve | extract 不連網；Qwen timestamp path 由 pipeline resolve ASR + forced aligner |
-| `asr/qwen3.py` | Qwen result → `BackendResult` | 接收 project-resolved local forced aligner；不決定 fallback |
-| `asr/sensevoice.py` | WAV chunks → `BackendResult` | 不偽造 word timestamp |
+| `asr/qwen3.py` | Qwen result → `BackendResult` | 分離 raw model timing、canonical timing classification 同 fallback timing；接收 project-resolved local forced aligner；不決定 backend fallback |
+| `asr/sensevoice.py` | WAV chunks → `BackendResult` | 30 秒 `yue` chunks、coarse timing 同 late-chunk diagnostics；不偽造 word timestamp |
 | `asr/vibevoice.py` | local 24 kHz WAV → native Transformers `BackendResult` | 不改 canonical speaker schema、不 fallback |
 | `progress.py` | backend-neutral events、TTY/plain renderers、elapsed/percentage helpers | 不執行 ASR |
 | `quality.py` | objective hard-failure metrics | 不做內容評分 |
@@ -108,8 +108,11 @@ class AsrBackend(Protocol):
 - pipeline 先 resolve `Qwen/Qwen3-ASR-1.7B` 同 `Qwen/Qwen3-ForcedAligner-0.6B`（或 CLI overrides），再將 forced aligner local snapshot path 傳入 pinned `forced_aligner` API；
 - 使用 local ASR snapshot、`return_timestamps=True`、`return_chunks=True`；
 - 使用 pinned runtime 嘅 structured `on_progress` callback，將 processed audio seconds／total duration 轉成 generic progress events；
-- 優先讀 model segments，冇先讀 chunks；
-- 保存 finish reason、truncation、aligner model/snapshot 同 timestamp provenance。
+- 優先讀 model segments，先驗證所有 word timing；zero-duration 只修復 canonical copy，raw copy 保持原值；
+- negative、non-finite、end-before-start、backwards 或 malformed word timing 會整組 reject，
+  唔排序或刪除單一 word；改用 valid chunks，否則交由 postprocessor 以 duration estimate；
+- 保存 raw segment diagnostics、repair/rejection counts、finish reason、truncation、aligner
+  model/snapshot 同 timestamp provenance。
 
 ### SenseVoice
 
@@ -117,7 +120,11 @@ class AsrBackend(Protocol):
 - normalized WAV 以 30 秒分段，逐段 `generate(..., language="yue", use_itn=False)`；
 - 逐個完成 chunk 以實際 audio seconds 報告 progress；
 - 保存 chunk start/end、language/emotion/event（如 runtime 有提供）；
-- 原生冇 word timestamp，postprocessor 對每個 chunk 做 weighted cue estimation。
+- `profile_text` 唔傳入 pinned SenseVoice `generate`；有 context 時只發 warning，唔聲稱 hotword
+  已使用；
+- 原生冇 word timestamp，postprocessor 對每個 chunk 做 weighted cue estimation；chunk N
+  failure 會喺 `BackendError.metadata` 保留 failed index、completed count、processed/total
+  seconds 同 completed chunk metadata，partial result 絕不當成功。
 
 ### VibeVoice
 
@@ -152,7 +159,7 @@ JSON 係 extract 唯一 output、亦係 export 唯一 input。主要區域：
 |---|---|
 | `source` | absolute path、name、size、SHA-256、media/signal metadata |
 | `request` | mode、user/default `language` request、context/hash、models、`offline: true` |
-| `attempts` | raw text/segments、quality、errors、runtime、snapshot |
+| `attempts` | raw text/timing、quality、errors、runtime、snapshot；raw timing 只要求 finite/JSON-safe，不套用 canonical range/order invariants |
 | `selected_attempt_id` | 成功 attempt pointer；failed 時為 null |
 | `transcript` | Traditional canonical text/segments 同 backend-known language；VibeVoice 未檢測時為 `language: "und"`；failed 時為 null |
 | `processing` | deterministic transforms、optional retained work path |
@@ -207,6 +214,10 @@ Backend-independent suite 注入 fake platform/probe/normalizer/signal/model/bac
 - no-fallback success、punctuation fallback、backend exception fallback；
 - subjective-but-substantive output 不 fallback；
 - explicit Qwen mode 不 fallback；
+- Qwen zero-duration repair、serious timing all-or-nothing reject、chunk/duration timing fallback、
+  raw timing round-trip 同 timing-only defect 不 fallback；
+- SenseVoice pinned local load/yue mapping、30 秒 boundaries、actual-frame progress、empty chunk
+  handling、metadata preservation 同 late-chunk failure provenance；
 - failed diagnostic JSON、attempt preservation、collision policy；
 - media command construction、signal analysis、text conversion/cue timing；
 - progress event math、TTY/plain/off rendering、fail-open stream/callback isolation、monotonic lifecycle/heartbeat ordering、backend failure cleanup、unknown duration tolerance、batch file index/collision preflight；

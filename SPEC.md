@@ -72,15 +72,26 @@ Qwen3 attempt 符合任一條件時，`auto` 先執行 SenseVoice：
 - canonical text 只做 Unicode NFC、control/whitespace normalization、OpenCC `s2hk` 同 subtitle cue grouping。
 - 唔翻譯、唔摘要、唔將廣東話改寫成普通話書面語。
 - context file 係 opt-in；path、SHA-256 同 backend limitation 寫入 JSON。
+- SenseVoice pinned API 未驗證支援 context/hotword injection；使用 context file 時只保留
+  provenance、發出 warning，唔可以假裝已注入 model。
 - `request.language` 係 user/default request；`transcript.language` 只代表 backend 已知／檢測到嘅語言。
 - VibeVoice 嘅 `--language` 不作 model conditioning 或 detection；只記錄 `metadata.requested_language`，`metadata.language_mode` 為 `not_detected`，canonical `transcript.language` 為 `und`。`profile_text` 只經 verified `prompt` interface 傳入。
 
 ### FR-07 Timing
 
-- Qwen word/model timestamps 轉成 canonical segments，`timing_source` 為 `model`。
+- `attempts[].raw_segments` 保存 finite backend timing anomalies，容許 zero duration、negative
+  range、end-before-start 同 non-monotonic order；`transcript.segments` 仍然要求 finite、
+  non-negative、positive duration 同 monotonic start order。
+- Qwen word/model timestamps 通過 deterministic classification 後先轉成 canonical segments，
+  `timing_source` 為 `model`。
+- Qwen zero-duration word timing 只喺 canonical path 以 minimum positive duration repair；raw
+  values、repair count 同 warning 必須保留。Negative、non-finite、end-before-start、
+  backwards 或 malformed word timing 會 all-or-nothing reject，唔排序、唔交換、唔只刪壞 word。
+- Qwen serious word-timing reject 後優先使用通過 validation 嘅 chunk timing；chunk timing
+  亦不可信時，保留完整 text 並由總 audio duration 估算。
 - VibeVoice 只有完整 structured `Start`／`End`／`Content` records 全部通過 validation 先會轉成 canonical segments，`timing_source` 為 `model`；speaker id 只保留喺 attempt metadata。
 - VibeVoice 任何 malformed／incomplete structured record 都會令該 attempt 使用零個 model segments；完整 transcription text 會保留，postprocessor 改用 project 嘅 estimated timing path，並保留 raw／parse diagnostics。
-- Qwen 如只得 chunk timing，或 SenseVoice chunk output，cue timing必須標成估算來源。
+- Qwen 如只得 chunk timing，或 SenseVoice chunk output，cue timing 必須標成估算來源。
 - 完全冇 timestamp 時，按 audio duration 同文字長度估算，並加入 warning。
 - SRT 只由 canonical segments 產生，唔聲稱 estimated timing 係 word-level timestamp。
 
@@ -119,6 +130,8 @@ JSON 包含 source metadata/hash、request、immutable attempts、selected attem
 ### FR-09 Failure behavior
 
 - 所有 ASR attempts 失敗：原子寫出 `status: "failed"` diagnostic JSON，CLI return code 1。
+- Explicit backend failure 嘅人類可讀錯誤必須包括最具體嘅 backend/model/chunk reason；machine-readable
+  package 可以保留 `error: "all_asr_attempts_failed"`。
 - 成功 JSON：`status: "completed"`、非空 `selected_attempt_id`、transcript text 同至少一個 segment。
 - work file 預設只清理本 run directory；`--keep-work-files` 先保留 normalized WAV。
 - Ctrl-C return code 130；configuration/media/model/schema errors return code 1。
@@ -187,7 +200,9 @@ mrp cache-size [--cache-dir PATH]
 }
 ```
 
-Normative machine-readable schema：`schemas/transcript-v1.schema.json`。
+Normative machine-readable schema：`schemas/transcript-v1.schema.json`。`$defs/segment` 只用於
+canonical transcript；`$defs/raw_segment` 用於可審計但不保證 timing range/order 嘅 finite raw
+backend timing。
 
 ## 5. Non-functional requirements
 
@@ -208,6 +223,7 @@ Normative machine-readable schema：`schemas/transcript-v1.schema.json`。
 - [x] Qwen3 同 SenseVoice adapter；backend lazy load。
 - [x] `auto` 客觀 hard-failure routing；明確 mode 無 silent fallback。
 - [x] raw attempts、quality、snapshot、provenance 同 failed diagnostic preservation。
+- [x] raw backend timing 同 canonical timing 分離；Qwen repair/reject policy、SenseVoice late-chunk diagnostics 同 model-free regressions。
 - [x] 香港繁體 deterministic post-processing，無內容改寫。
 - [x] JSON → TXT/SRT export；failed JSON fail closed。
 - [x] unit/integration tests 無需真 model。

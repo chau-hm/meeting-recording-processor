@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 import tempfile
 from typing import Any
@@ -28,17 +29,22 @@ _LANGUAGE_MAP = {
 
 
 def _rich_metadata(result: object) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
     items = getattr(result, "segments", None)
-    if not isinstance(items, (list, tuple)) or not items:
-        return {}
-    first = items[0]
-    if not isinstance(first, dict):
-        return {}
-    return {
-        key: first.get(key)
-        for key in ("language", "emotion", "event")
-        if first.get(key) is not None
-    }
+    if isinstance(items, (list, tuple)) and items and isinstance(items[0], dict):
+        first = items[0]
+        metadata.update(
+            {
+                key: first.get(key)
+                for key in ("language", "emotion", "event")
+                if first.get(key) is not None
+            }
+        )
+    if metadata.get("language") is None:
+        language = getattr(result, "language", None)
+        if language is not None:
+            metadata["language"] = language
+    return metadata
 
 
 def _write_chunk(
@@ -72,6 +78,8 @@ class SenseVoiceBackend:
         self.model_id = model_id
         self.model_path = model_path
         self.verbose = verbose
+        if not math.isfinite(chunk_seconds) or chunk_seconds <= 0:
+            raise ValueError("SenseVoice chunk_seconds must be a positive finite number")
         self.chunk_seconds = chunk_seconds
 
     def transcribe(
@@ -82,21 +90,29 @@ class SenseVoiceBackend:
         profile_text: str | None,
         progress_callback: ProgressCallback | None = None,
     ) -> BackendResult:
+        language_code = _LANGUAGE_MAP.get(language.strip().lower())
+        if language_code is None:
+            raise BackendError(f"SenseVoice 唔支援 language value：{language}")
+
+        warnings: list[str] = []
+        if profile_text:
+            warnings.append("SenseVoice adapter 不支援 context hotwords；已保留設定但冇注入 model")
+
         try:
             from mlx_audio.stt import load
 
             model = load(str(self.model_path))
         except Exception as exc:
-            raise BackendError(f"SenseVoice model 載入失敗：{exc}") from exc
+            raise BackendError(
+                f"SenseVoice model 載入失敗：{exc}",
+                metadata={
+                    "model_path": str(self.model_path),
+                    "language": language_code,
+                },
+                warnings=tuple(warnings),
+            ) from exc
 
-        language_code = _LANGUAGE_MAP.get(language.lower())
-        if language_code is None:
-            raise BackendError(f"SenseVoice 唔支援 language value：{language}")
-
-        warnings: list[str] = []
         report_progress = isolate_progress_callback(progress_callback)
-        if profile_text:
-            warnings.append("SenseVoice adapter 不支援 context hotwords；已保留設定但冇注入 model")
 
         segments: list[TranscriptSegment] = []
         chunk_metadata: list[dict[str, Any]] = []
@@ -112,6 +128,8 @@ class SenseVoiceBackend:
             sample_rate = source.getframerate()
             if source.getnchannels() != 1 or source.getsampwidth() != 2:
                 raise MediaError("SenseVoice input 必須係 16-bit mono WAV")
+            if sample_rate <= 0:
+                raise MediaError("SenseVoice input WAV sample rate 無效")
             frames_per_chunk = max(1, int(sample_rate * self.chunk_seconds))
             total_duration = source.getnframes() / sample_rate if sample_rate else None
             if report_progress is not None:
@@ -126,6 +144,7 @@ class SenseVoiceBackend:
                 )
             offset_frames = 0
             chunk_index = 0
+            previous_start: float | None = None
             while True:
                 chunk_path = Path(temporary) / f"chunk-{chunk_index:05d}.wav"
                 written_frames = _write_chunk(
@@ -143,8 +162,18 @@ class SenseVoiceBackend:
                         verbose=self.verbose,
                     )
                 except Exception as exc:
+                    failure_metadata = {
+                        "failed_chunk_index": chunk_index,
+                        "completed_chunk_count": len(chunk_metadata),
+                        "processed_audio_seconds": offset_frames / sample_rate,
+                        "total_audio_seconds": total_duration,
+                        "completed_chunks": list(chunk_metadata),
+                        "language": language_code,
+                    }
                     raise BackendError(
-                        f"SenseVoice 第 {chunk_index + 1} 段轉錄失敗：{exc}"
+                        f"SenseVoice 第 {chunk_index + 1} 段轉錄失敗：{exc}",
+                        metadata=failure_metadata,
+                        warnings=tuple(warnings),
                     ) from exc
                 text = str(getattr(result, "text", "") or "")
                 rich = _rich_metadata(result)
@@ -156,6 +185,26 @@ class SenseVoiceBackend:
                         **rich,
                     }
                 )
+                if (
+                    not math.isfinite(start)
+                    or not math.isfinite(end)
+                    or start < 0
+                    or end <= start
+                    or (previous_start is not None and start < previous_start)
+                ):
+                    raise BackendError(
+                        "SenseVoice 產生咗無效 chunk timing",
+                        metadata={
+                            "failed_chunk_index": chunk_index,
+                            "completed_chunk_count": len(chunk_metadata) - 1,
+                            "processed_audio_seconds": offset_frames / sample_rate,
+                            "total_audio_seconds": total_duration,
+                            "completed_chunks": list(chunk_metadata[:-1]),
+                            "language": language_code,
+                        },
+                        warnings=tuple(warnings),
+                    )
+                previous_start = start
                 if text.strip():
                     texts.append(text)
                     segments.append(
@@ -194,6 +243,11 @@ class SenseVoiceBackend:
             model=self.model_id,
             text="\n".join(texts),
             segments=tuple(segments),
-            metadata={"chunks": chunk_metadata, "timestamp_source": "chunk"},
+            metadata={
+                "chunks": chunk_metadata,
+                "chunk_count": len(chunk_metadata),
+                "total_audio_seconds": total_duration,
+                "timestamp_source": "chunk",
+            },
             warnings=tuple(warnings),
         )

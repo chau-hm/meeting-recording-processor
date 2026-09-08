@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -24,19 +25,33 @@ def _require_nonempty_string(value: object, label: str) -> str:
     return value
 
 
-def _validate_segments(segments: object, *, label: str) -> None:
+def _finite_number(value: object, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise SchemaError(f"{label} 時間格式無效")
+    try:
+        number = float(value)
+    except OverflowError as exc:
+        raise SchemaError(f"{label} 時間格式無效") from exc
+    if not math.isfinite(number):
+        raise SchemaError(f"{label} 時間格式無效")
+    return number
+
+
+def _validate_canonical_segments(segments: object, *, label: str) -> None:
     if not isinstance(segments, list):
         raise SchemaError(f"{label} 必須係 array")
-    previous_start = -1.0
+    previous_start: float | None = None
     for index, segment in enumerate(segments):
         if not isinstance(segment, dict):
             raise SchemaError(f"{label}[{index}] 必須係 object")
         try:
-            start = float(segment["start"])
-            end = float(segment["end"])
-        except (KeyError, TypeError, ValueError) as exc:
+            start = _finite_number(segment["start"], f"{label}[{index}].start")
+            end = _finite_number(segment["end"], f"{label}[{index}].end")
+        except KeyError as exc:
             raise SchemaError(f"{label}[{index}] 時間格式無效") from exc
-        if start < 0 or end <= start or start < previous_start:
+        if start < 0 or end <= start or (
+            previous_start is not None and start < previous_start
+        ):
             raise SchemaError(f"{label}[{index}] 時間範圍無效或次序錯誤")
         _require_nonempty_string(segment.get("text"), f"{label}[{index}].text")
         timing_source = segment.get("timing_source")
@@ -45,9 +60,47 @@ def _validate_segments(segments: object, *, label: str) -> None:
         previous_start = start
 
 
+def _validate_raw_segments(segments: object, *, label: str) -> None:
+    if not isinstance(segments, list):
+        raise SchemaError(f"{label} 必須係 array")
+    for index, segment in enumerate(segments):
+        if not isinstance(segment, dict):
+            raise SchemaError(f"{label}[{index}] 必須係 object")
+        try:
+            _finite_number(segment["start"], f"{label}[{index}].start")
+            _finite_number(segment["end"], f"{label}[{index}].end")
+        except KeyError as exc:
+            raise SchemaError(f"{label}[{index}] 時間格式無效") from exc
+        _require_nonempty_string(segment.get("text"), f"{label}[{index}].text")
+        timing_source = segment.get("timing_source")
+        if timing_source not in TIMING_SOURCES:
+            raise SchemaError(f"{label}[{index}].timing_source 無效")
+
+
+def _validate_json_safe(value: object, *, label: str = "package") -> None:
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise SchemaError(f"{label} 包含非有限 numeric value")
+        return
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _validate_json_safe(item, label=f"{label}[{index}]")
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise SchemaError(f"{label} object key 必須係 string")
+            _validate_json_safe(item, label=f"{label}.{key}")
+        return
+    raise SchemaError(f"{label} 包含不可序列化 value")
+
+
 def validate_package(payload: object, *, require_completed: bool = False) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise SchemaError("transcript JSON 頂層必須係 object")
+    _validate_json_safe(payload)
     if payload.get("schema_version") != SCHEMA_VERSION:
         raise SchemaError(f"不支援 schema_version：{payload.get('schema_version')!r}")
     status = payload.get("status")
@@ -75,7 +128,7 @@ def validate_package(payload: object, *, require_completed: bool = False) -> dic
             raise SchemaError(f"attempts[{index}].status 無效")
         raw_segments = attempt.get("raw_segments")
         if raw_segments is not None:
-            _validate_segments(raw_segments, label=f"attempts[{index}].raw_segments")
+            _validate_raw_segments(raw_segments, label=f"attempts[{index}].raw_segments")
         attempt_statuses[attempt_id] = str(attempt_status)
 
     transcript = payload.get("transcript")
@@ -94,7 +147,7 @@ def validate_package(payload: object, *, require_completed: bool = False) -> dic
         segments = transcript.get("segments")
         if not isinstance(segments, list) or not segments:
             raise SchemaError("transcript.segments 必須係非空白 array")
-        _validate_segments(segments, label="transcript.segments")
+        _validate_canonical_segments(segments, label="transcript.segments")
     else:
         if payload.get("selected_attempt_id") is not None:
             raise SchemaError("failed package 嘅 selected_attempt_id 必須係 null")
@@ -144,7 +197,16 @@ def _atomic_write(path: Path, content: str, *, overwrite: bool) -> None:
 
 def write_package(path: Path, payload: dict[str, Any], *, overwrite: bool = False) -> None:
     validate_package(payload)
-    content = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=False) + "\n"
+    content = (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=False,
+            allow_nan=False,
+        )
+        + "\n"
+    )
     _atomic_write(path, content, overwrite=overwrite)
 
 

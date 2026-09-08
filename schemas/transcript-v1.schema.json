@@ -97,7 +97,7 @@
         "raw_text": {"type": "string"},
         "raw_segments": {
           "type": "array",
-          "items": {"$ref": "#/$defs/segment"}
+          "items": {"$ref": "#/$defs/raw_segment"}
         },
         "quality": {"$ref": "#/$defs/quality"},
         "metadata": {"type": "object"},
@@ -119,6 +119,19 @@
           "type": "array",
           "minItems": 1,
           "items": {"$ref": "#/$defs/segment"}
+        }
+      },
+      "additionalProperties": true
+    },
+    "raw_segment": {
+      "type": "object",
+      "required": ["start", "end", "text", "timing_source"],
+      "properties": {
+        "start": {"type": "number"},
+        "end": {"type": "number"},
+        "text": {"type": "string", "minLength": 1},
+        "timing_source": {
+          "enum": ["model", "chunk", "estimated_from_chunk", "estimated_from_duration"]
         }
       },
       "additionalProperties": true
