@@ -11,6 +11,7 @@ import sys
 from typing import Any
 
 from .config import (
+    DEFAULT_QWEN_ALIGNER_MODEL,
     DEFAULT_QWEN_MODEL,
     DEFAULT_SENSEVOICE_MODEL,
     DEFAULT_VIBEVOICE_MODEL,
@@ -53,12 +54,20 @@ def _vibevoice_mps_report() -> dict[str, Any]:
     }
 
 
-def doctor_report(cache_dir: Path) -> dict[str, Any]:
+def doctor_report(
+    cache_dir: Path,
+    *,
+    qwen_model: str = DEFAULT_QWEN_MODEL,
+    qwen_aligner_model: str = DEFAULT_QWEN_ALIGNER_MODEL,
+    sensevoice_model: str = DEFAULT_SENSEVOICE_MODEL,
+    vibevoice_model: str = DEFAULT_VIBEVOICE_MODEL,
+) -> dict[str, Any]:
     models: dict[str, dict[str, Any]] = {}
     for backend, model_id in (
-        ("qwen3", DEFAULT_QWEN_MODEL),
-        ("sensevoice", DEFAULT_SENSEVOICE_MODEL),
-        ("vibevoice", DEFAULT_VIBEVOICE_MODEL),
+        ("qwen3", qwen_model),
+        ("qwen3-aligner", qwen_aligner_model),
+        ("sensevoice", sensevoice_model),
+        ("vibevoice", vibevoice_model),
     ):
         try:
             resolved = resolve_cached_model(model_id, cache_dir)

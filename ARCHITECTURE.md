@@ -69,8 +69,8 @@ stateDiagram-v2
 | `media/probe.py` | ffprobe JSON、audio stream selection | 不 decode transcript |
 | `media/normalize.py` | ffmpeg stream map、backend-specific PCM WAV | 不改 input |
 | `media/signal.py` | duration/RMS/active-audio stats | 不評主觀準確度 |
-| `models.py` | explicit download、offline snapshot resolve | extract 不連網 |
-| `asr/qwen3.py` | Qwen result → `BackendResult` | 不決定 fallback |
+| `models.py` | explicit download、offline snapshot resolve | extract 不連網；Qwen timestamp path 由 pipeline resolve ASR + forced aligner |
+| `asr/qwen3.py` | Qwen result → `BackendResult` | 接收 project-resolved local forced aligner；不決定 fallback |
 | `asr/sensevoice.py` | WAV chunks → `BackendResult` | 不偽造 word timestamp |
 | `asr/vibevoice.py` | local 24 kHz WAV → native Transformers `BackendResult` | 不改 canonical speaker schema、不 fallback |
 | `progress.py` | backend-neutral events、TTY/plain renderers、elapsed/percentage helpers | 不執行 ASR |
@@ -105,10 +105,11 @@ class AsrBackend(Protocol):
 ### Qwen3
 
 - lazy import `mlx_qwen3_asr.transcribe`；
-- 使用 local snapshot path、`return_timestamps=True`、`return_chunks=True`；
+- pipeline 先 resolve `Qwen/Qwen3-ASR-1.7B` 同 `Qwen/Qwen3-ForcedAligner-0.6B`（或 CLI overrides），再將 forced aligner local snapshot path 傳入 pinned `forced_aligner` API；
+- 使用 local ASR snapshot、`return_timestamps=True`、`return_chunks=True`；
 - 使用 pinned runtime 嘅 structured `on_progress` callback，將 processed audio seconds／total duration 轉成 generic progress events；
 - 優先讀 model segments，冇先讀 chunks；
-- 保存 finish reason、truncation 同 timestamp provenance。
+- 保存 finish reason、truncation、aligner model/snapshot 同 timestamp provenance。
 
 ### SenseVoice
 
@@ -123,10 +124,11 @@ class AsrBackend(Protocol):
 - 使用 pinned `transformers>=5.3.0,<5.4.0` native `AutoProcessor` 同 `VibeVoiceAsrForConditionalGeneration`；
 - extract 只傳入 model resolver 回傳嘅 local snapshot，並以 `local_files_only=True` 建立 processor/model；
 - 要求可用 Apple Silicon MPS；現時以 `dtype=torch.float32` 明確載入並驗證實際 model dtype，唔會隱藏 fallback 到 CPU；FP32 可能需要較多 unified memory；
+- generation 明確傳入 `acoustic_tokenizer_chunk_size`，project default 係 64000 samples（24 kHz；3200 hop-size multiple），一次 attempt 只使用一個 configured value；
 - `apply_transcription_request(audio=local_wav, prompt=profile_text or None)` 對應 context hint；
 - 完整 `decode(..., return_format="parsed")` records 通過 Start/End/Content validation 先轉成 model-timed segments；任何 malformed/incomplete record 都會令所有 model segments 歸零；
 - structured parse 失敗時，只接受明確唔等於 raw model output 嘅 `transcription_only` text；否則以 `BackendError` fail closed，避免 JSON/model markup 進入 quality gate；
-- speaker id、raw decoded output、parse diagnostics 同 device/dtype/runtime provenance 保留喺 attempt metadata；canonical schema 暫不加入 speaker。
+- speaker id、raw decoded output、parse diagnostics 同 device/dtype/runtime provenance 保留喺 attempt metadata；generation failure 會保留 base runtime/chunk metadata 同 best-effort public MPS memory counters；canonical schema 暫不加入 speaker。
 
 ## 5. Quality gate
 
@@ -196,7 +198,7 @@ input (read-only)
 
 ## 8. Offline model lifecycle
 
-`download-model` 係唯一 network-aware path：Hugging Face cache environment 設為 online 並下載 snapshot。`extract` 每次都重新設成 offline，加 `local_files_only=True` resolve；cache miss 轉成 domain error，絕不傳 media 到 remote service。VibeVoice 嘅 native processor/model 亦只接受 local snapshot path，唔會喺 extract 以 model id 觸發 remote fetch。`doctor` 只會 import torch 並檢查 `torch.backends.mps.is_available()`，唔會載入 VibeVoice model；MPS capability 會獨立列喺 `runtime.vibevoice-mps`，並納入 `healthy`。
+`download-model` 係唯一 network-aware path：Hugging Face cache environment 設為 online 並下載 snapshot；Qwen3 target 會下載 ASR 同 forced aligner 兩個 snapshots。`extract` 每次都重新設成 offline，加 `local_files_only=True` resolve；Qwen timestamp preflight 會先 resolve 兩個 local assets，cache miss 轉成 domain error，絕不傳 media 到 remote service。VibeVoice 嘅 native processor/model 亦只接受 local snapshot path，唔會喺 extract 以 model id 觸發 remote fetch。`doctor` 只會 import torch 並檢查 `torch.backends.mps.is_available()`，唔會載入 VibeVoice model；MPS capability 會獨立列喺 `runtime.vibevoice-mps`，並納入 `healthy`。
 
 ## 9. Verification strategy
 
@@ -210,6 +212,7 @@ Backend-independent suite 注入 fake platform/probe/normalizer/signal/model/bac
 - progress event math、TTY/plain/off rendering、fail-open stream/callback isolation、monotonic lifecycle/heartbeat ordering、backend failure cleanup、unknown duration tolerance、batch file index/collision preflight；
 - completed/failed schema、TXT/SRT output、CLI defaults。
 - VibeVoice model-free adapter mapping、MPS/offline guard、24 kHz normalization、duration limit、indeterminate progress 同 explicit-only routing。
+- Qwen ASR/aligner download + doctor readiness、offline preflight/local-path wiring/provenance；VibeVoice chunk-size validation/generation wiring/base failure metadata 同 no-fallback package preservation。
 
 支援平台上另需 integration smoke tests：三個 model family load、六種 input containers、影片 audio-only selection、offline cache miss/hit、VibeVoice 60 分鐘 limit 同實際 SRT sync。
 

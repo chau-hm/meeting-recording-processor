@@ -44,10 +44,16 @@ class CliTests(unittest.TestCase):
                 "vibevoice",
                 "--vibevoice-model",
                 "local/vibevoice",
+                "--qwen-aligner-model",
+                "local/qwen-aligner",
+                "--vibevoice-acoustic-chunk-size",
+                "32000",
             ]
         )
         self.assertEqual(args.asr, "vibevoice")
         self.assertEqual(args.vibevoice_model, "local/vibevoice")
+        self.assertEqual(args.qwen_aligner_model, "local/qwen-aligner")
+        self.assertEqual(args.vibevoice_acoustic_chunk_size, 32000)
 
     def test_download_parser_supports_vibevoice_and_all(self) -> None:
         vibevoice = build_parser().parse_args(
@@ -79,10 +85,57 @@ class CliTests(unittest.TestCase):
             [model_id for model_id, _cache_dir in downloaded],
             [
                 args.qwen_model,
+                args.qwen_aligner_model,
                 args.sensevoice_model,
                 args.vibevoice_model,
             ],
         )
+
+    def test_download_qwen_includes_forced_aligner(self) -> None:
+        args = build_parser().parse_args(["download-model", "--asr", "qwen3"])
+        downloaded: list[str] = []
+        with (
+            patch("meeting_recording_processor.cli.require_apple_silicon"),
+            patch(
+                "meeting_recording_processor.cli.download_model",
+                side_effect=lambda model_id, _cache_dir: (
+                    downloaded.append(model_id)
+                    or ResolvedModel(model_id, Path("snapshot"), "snapshot")
+                ),
+            ),
+            patch("meeting_recording_processor.cli.directory_size", return_value=0),
+            patch("meeting_recording_processor.cli.human_size", return_value="0 B"),
+        ):
+            result = _run_download(args)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(downloaded, [args.qwen_model, args.qwen_aligner_model])
+
+    def test_doctor_prints_qwen_aligner_as_separate_asset(self) -> None:
+        args = build_parser().parse_args(["doctor"])
+        output = StringIO()
+        report = {
+            "platform": {"system": "Darwin", "machine": "arm64"},
+            "python": {"version": "3.12.0"},
+            "commands": {},
+            "packages": {},
+            "runtime": {},
+            "models": {
+                "qwen3": {"available": True, "snapshot": "asr-snapshot"},
+                "qwen3-aligner": {"available": False, "detail": "missing"},
+            },
+            "cache_dir": "/tmp/cache",
+            "healthy": False,
+        }
+        with (
+            patch("meeting_recording_processor.cli.doctor_report", return_value=report),
+            redirect_stdout(output),
+        ):
+            result = _run_doctor(args)
+
+        self.assertEqual(result, 1)
+        self.assertIn("OK      model:qwen3", output.getvalue())
+        self.assertIn("MISSING model:qwen3-aligner", output.getvalue())
 
     def test_doctor_prints_vibevoice_mps_runtime_status(self) -> None:
         args = build_parser().parse_args(["doctor"])

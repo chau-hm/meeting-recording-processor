@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from meeting_recording_processor.config import DEFAULT_QWEN_ALIGNER_MODEL
 from meeting_recording_processor.diagnostics import doctor_report
 from meeting_recording_processor.models import ResolvedModel
 
@@ -44,9 +45,51 @@ class DiagnosticsTests(unittest.TestCase):
 
         self.assertTrue(report["packages"]["torch"]["available"])
         self.assertTrue(report["models"]["vibevoice"]["available"])
+        self.assertTrue(report["models"]["qwen3"]["available"])
+        self.assertTrue(report["models"]["qwen3-aligner"]["available"])
         self.assertEqual(report["models"]["vibevoice"]["snapshot"], "snapshot-test")
         self.assertTrue(report["runtime"]["vibevoice-mps"]["available"])
         self.assertTrue(report["healthy"])
+
+    def test_doctor_marks_missing_qwen_aligner_as_unhealthy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cache_dir = Path(temporary)
+
+            def resolve(model_id, _cache):
+                if model_id == DEFAULT_QWEN_ALIGNER_MODEL:
+                    raise RuntimeError("aligner missing")
+                return ResolvedModel(model_id, cache_dir / "snapshot", "snapshot-test")
+
+            with patch(
+                "meeting_recording_processor.diagnostics.resolve_cached_model",
+                side_effect=resolve,
+            ):
+                report = doctor_report(cache_dir)
+
+        self.assertTrue(report["models"]["qwen3"]["available"])
+        self.assertFalse(report["models"]["qwen3-aligner"]["available"])
+        self.assertEqual(report["models"]["qwen3-aligner"]["detail"], "aligner missing")
+        self.assertFalse(report["healthy"])
+
+    def test_doctor_marks_missing_qwen_asr_as_unhealthy_with_cached_aligner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cache_dir = Path(temporary)
+
+            def resolve(model_id, _cache):
+                if model_id == "Qwen/Qwen3-ASR-1.7B":
+                    raise RuntimeError("asr missing")
+                return ResolvedModel(model_id, cache_dir / "snapshot", "snapshot-test")
+
+            with patch(
+                "meeting_recording_processor.diagnostics.resolve_cached_model",
+                side_effect=resolve,
+            ):
+                report = doctor_report(cache_dir)
+
+        self.assertFalse(report["models"]["qwen3"]["available"])
+        self.assertTrue(report["models"]["qwen3-aligner"]["available"])
+        self.assertEqual(report["models"]["qwen3"]["detail"], "asr missing")
+        self.assertFalse(report["healthy"])
 
     def test_doctor_marks_mps_unavailable_as_unhealthy(self) -> None:
         torch_module = SimpleNamespace(

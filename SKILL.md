@@ -13,8 +13,8 @@ description: Locally extract Cantonese-heavy meeting audio or video to a canonic
 
 1. 只接受 `.m4a`、`.mp3`、`.wav`、`.flac`、`.mp4`、`.mov` regular file。
 2. 必須係 macOS Apple Silicon arm64，並已安裝 `uv`、`ffmpeg`、`ffprobe`。
-3. 先執行 `uv run mrp doctor`。缺少 model 時，向使用者說明並明確執行 `uv run mrp download-model --asr all`；下載係唯一可連網步驟。VibeVoice 係大型 model，並要求 Apple Silicon MPS。
-`doctor` 會分開檢查 package presence 同 `runtime:vibevoice-mps` readiness；MPS unavailable 時唔好開始 VibeVoice extract。
+3. 先執行 `uv run mrp doctor`。缺少 model 時，向使用者說明並明確執行 `uv run mrp download-model --asr all`；Qwen3 timestamp path 需要 ASR model 同 forced aligner，`download-model --asr qwen3` 會下載完整 set。下載係唯一可連網步驟。VibeVoice 係大型 model，並要求 Apple Silicon MPS。
+`doctor` 會分開檢查 `model:qwen3`、`model:qwen3-aligner`、package presence 同 `runtime:vibevoice-mps` readiness；MPS unavailable 或任一 Qwen asset 缺失時唔好開始相應 extract。
 4. 唔可以 upload media、transcript 或 context，亦唔可以改用 cloud ASR。
 
 ## Step 1 — Extract
@@ -26,7 +26,7 @@ uv run mrp extract <input> --asr auto
 ```
 
 必要時可以加入 `--context-file`、`--output-dir`、`--work-dir`、`--cache-dir` 或 `--progress auto|on|off`。亦可以用 `ASR_PROGRESS=auto|on|off` 控制進度輸出。預設 `auto` 先 Qwen3，只喺客觀 hard failure fallback SenseVoice：backend exception、空白、Unicode 標點／符號比例超過 90%，或至少 10 秒 active audio 但少過 3 個 substantive 字元。
-如要明確評估 VibeVoice，使用 `uv run mrp extract <input> --asr vibevoice`。VibeVoice 輸入係 24 kHz、現時 MPS path 使用 FP32、最多單次 60 分鐘；`--language` 只保留喺 request／attempt metadata，canonical transcript language 係 `und`，因為 backend 未提供 verified language detection。完整 speaker/timestamp structured output 會保留喺 attempt metadata，但 canonical schema 暫時唔啟用 diarization。
+如要明確評估 VibeVoice，使用 `uv run mrp extract <input> --asr vibevoice`。VibeVoice 輸入係 24 kHz、現時 MPS path 使用 FP32、最多單次 60 分鐘；預設 `acoustic_tokenizer_chunk_size` 係 64000 samples，可用 `--vibevoice-acoustic-chunk-size` 調整（正整數、3200 倍數）。較細 chunk 只降低 tokenizer peak memory，唔保證長錄音一定 fit unified memory；project 唔會停用 PyTorch MPS high-watermark protection。`--language` 只保留喺 request／attempt metadata，canonical transcript language 係 `und`，因為 backend 未提供 verified language detection。完整 speaker/timestamp structured output 會保留喺 attempt metadata，但 canonical schema 暫時唔啟用 diarization。
 
 一般專有名詞、accuracy、punctuation 或 segmentation 問題唔可以觸發自動 fallback。使用者如要求人工重試，另行執行 `--asr sensevoice` 並使用另一 output directory，避免覆蓋第一次 JSON。
 
