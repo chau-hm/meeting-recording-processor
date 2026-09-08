@@ -69,7 +69,7 @@ stateDiagram-v2
 | `media/probe.py` | ffprobe JSON、audio stream selection | 不 decode transcript |
 | `media/normalize.py` | ffmpeg stream map、backend-specific PCM WAV | 不改 input |
 | `media/signal.py` | duration/RMS/active-audio stats | 不評主觀準確度 |
-| `models.py` | explicit download、offline snapshot resolve | extract 不連網；Qwen timestamp path 由 pipeline resolve ASR + forced aligner |
+| `models.py` | typed ASR model inventory、explicit download、offline snapshot resolve、cache API clear/inspect | extract 不連網；Qwen timestamp path 由 pipeline resolve ASR + forced aligner |
 | `asr/qwen3.py` | Qwen result → `BackendResult` | 分離 raw model timing、canonical timing classification 同 fallback timing；接收 project-resolved local forced aligner；不決定 backend fallback |
 | `asr/sensevoice.py` | WAV chunks → `BackendResult` | 30 秒 `yue` chunks、coarse timing 同 late-chunk diagnostics；不偽造 word timestamp |
 | `asr/vibevoice.py` | local 24 kHz WAV → native Transformers `BackendResult` | 不改 canonical speaker schema、不 fallback |
@@ -77,6 +77,7 @@ stateDiagram-v2
 | `quality.py` | objective hard-failure metrics | 不做內容評分 |
 | `postprocess.py` | NFC、whitespace、s2hk、cue grouping | 不翻譯／摘要／改寫 |
 | `pipeline.py` | lifecycle、routing、attempt preservation | 不輸出 TXT/SRT |
+| `benchmark.py` | local model eligibility、sequential explicit-backend orchestration、benchmark report | 不改 ASR quality/fallback；不下載 model |
 | `schema_io.py` | validation、atomic JSON/text writes | 不做 ASR |
 | `outputs/writers.py` | completed JSON → TXT/SRT | 拒絕 failed JSON |
 | `diagnostics.py` | platform/package/model availability 同 VibeVoice MPS capability report | 不修復、下載或載入 model |
@@ -202,10 +203,40 @@ input (read-only)
 - `batch` 會喺第一個 extraction 前 preflight 全部 stem-based destinations，並以 case-insensitive key 拒絕 intra-batch collision；`--overwrite` 唔會繞過呢個 preflight；
 - temp file同 final output 位於同一 parent，以 `os.replace` 原子提交；
 - JSON 保存 raw attempt，所以 canonical s2hk conversion 不會破壞原始證據。
+- benchmark output 使用 `output/benchmark/<input-stem>/<backend>/` isolation；每個 backend
+  transcript 同 `benchmark.json` 都遵守 fail-on-collision／explicit overwrite。
 
 ## 8. Offline model lifecycle
 
-`download-model` 係唯一 network-aware path：Hugging Face cache environment 設為 online 並下載 snapshot；Qwen3 target 會下載 ASR 同 forced aligner 兩個 snapshots。`extract` 每次都重新設成 offline，加 `local_files_only=True` resolve；Qwen timestamp preflight 會先 resolve 兩個 local assets，cache miss 轉成 domain error，絕不傳 media 到 remote service。VibeVoice 嘅 native processor/model 亦只接受 local snapshot path，唔會喺 extract 以 model id 觸發 remote fetch。`doctor` 只會 import torch 並檢查 `torch.backends.mps.is_available()`，唔會載入 VibeVoice model；MPS capability 會獨立列喺 `runtime.vibevoice-mps`，並納入 `healthy`。
+`download-model` 係唯一 network-aware path：Hugging Face cache environment 設為 online 並下載
+snapshot；Qwen3 target 會下載 ASR 同 forced aligner 兩個 snapshots。`extract` 每次都重新設成
+offline，加 `local_files_only=True` resolve；Qwen timestamp preflight 會先 resolve 兩個 local
+assets，cache miss 轉成 domain error，絕不傳 media 到 remote service。VibeVoice 嘅 native
+processor/model 亦只接受 local snapshot path，唔會喺 extract 以 model id 觸發 remote fetch。
+`clear-model` 同 `benchmark` 使用 `models.py` 嘅同一 typed inventory；clear 透過
+`huggingface_hub.scan_cache_dir`、`DeleteCacheStrategy` 同 repository-scoped incomplete-file
+metadata 只刪選定 repositories 嘅 cached revisions／partial downloads。Benchmark 先用 cache
+scan 識別 presence，再對每個 required asset 做 local-only snapshot resolution 判斷 complete，
+唔呼叫 download path。`doctor` 只會
+import torch 並檢查 `torch.backends.mps.is_available()`，唔會載入 VibeVoice model；MPS
+capability 會獨立列喺 `runtime.vibevoice-mps`，並納入 `healthy`。
+
+### Local benchmark flow
+
+```text
+input
+  ├─ ffprobe duration (once for report)
+  └─ model inventory/cache eligibility
+       ├─ qwen3 (ASR + forced aligner) ── explicit extract ──> benchmark/qwen3/
+       ├─ sensevoice ─────────────────── explicit extract ──> benchmark/sensevoice/
+       └─ vibevoice (experimental opt-in) ─ explicit extract -> benchmark/vibevoice/
+                                      ↓
+                             benchmark.json (atomic)
+```
+
+Candidates are processed sequentially. Missing assets or runtime prerequisites become
+`skipped`; a `failed` explicit extraction does not stop later candidates. The report stores
+relative backend output paths and canonical transcript character counts, but no quality score.
 
 ## 9. Verification strategy
 
@@ -224,6 +255,8 @@ Backend-independent suite 注入 fake platform/probe/normalizer/signal/model/bac
 - completed/failed schema、TXT/SRT output、CLI defaults。
 - VibeVoice model-free adapter mapping、MPS/offline guard、24 kHz normalization、duration limit、indeterminate progress 同 explicit-only routing。
 - Qwen ASR/aligner download + doctor readiness、offline preflight/local-path wiring/provenance；VibeVoice chunk-size validation/generation wiring/base failure metadata 同 no-fallback package preservation。
+- typed model inventory、cache API model clearing、dry-run safety、offline sequential
+  benchmark eligibility/report/exit-code behavior。
 
 支援平台上另需 integration smoke tests：三個 model family load、六種 input containers、影片 audio-only selection、offline cache miss/hit、VibeVoice 60 分鐘 limit 同實際 SRT sync。
 

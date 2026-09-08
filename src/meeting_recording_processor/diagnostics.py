@@ -16,7 +16,7 @@ from .config import (
     DEFAULT_SENSEVOICE_MODEL,
     DEFAULT_VIBEVOICE_MODEL,
 )
-from .models import resolve_cached_model
+from .models import build_model_inventory, resolve_cached_model
 
 
 def _distribution_version(name: str) -> str | None:
@@ -63,23 +63,29 @@ def doctor_report(
     vibevoice_model: str = DEFAULT_VIBEVOICE_MODEL,
 ) -> dict[str, Any]:
     models: dict[str, dict[str, Any]] = {}
-    for backend, model_id in (
-        ("qwen3", qwen_model),
-        ("qwen3-aligner", qwen_aligner_model),
-        ("sensevoice", sensevoice_model),
-        ("vibevoice", vibevoice_model),
-    ):
-        try:
-            resolved = resolve_cached_model(model_id, cache_dir)
-        except Exception as exc:
-            models[backend] = {"model": model_id, "available": False, "detail": str(exc)}
-        else:
-            models[backend] = {
-                "model": model_id,
-                "available": True,
-                "snapshot": resolved.snapshot,
-                "path": str(resolved.path),
-            }
+    inventory = build_model_inventory(
+        qwen_model=qwen_model,
+        qwen_aligner_model=qwen_aligner_model,
+        sensevoice_model=sensevoice_model,
+        vibevoice_model=vibevoice_model,
+    )
+    for model_set in inventory:
+        for asset in model_set.assets:
+            try:
+                resolved = resolve_cached_model(asset.model_id, cache_dir)
+            except Exception as exc:
+                models[asset.name] = {
+                    "model": asset.model_id,
+                    "available": False,
+                    "detail": str(exc),
+                }
+            else:
+                models[asset.name] = {
+                    "model": asset.model_id,
+                    "available": True,
+                    "snapshot": resolved.snapshot,
+                    "path": str(resolved.path),
+                }
 
     report: dict[str, Any] = {
         "platform": {
