@@ -6,13 +6,15 @@ import math
 from pathlib import Path
 from typing import Any, Callable
 
+from ..config import DEFAULT_QWEN_ALIGNER_MODEL, DEFAULT_QWEN_MODEL
 from ..errors import BackendError
 from ..progress import ProgressEvent, ProgressPhase
 from ..schemas import BackendResult, TranscriptSegment
 from .base import ProgressCallback, isolate_progress_callback
 
 BACKEND_NAME = "qwen3"
-DEFAULT_MODEL_ID = "Qwen/Qwen3-ASR-1.7B"
+DEFAULT_MODEL_ID = DEFAULT_QWEN_MODEL
+DEFAULT_ALIGNER_MODEL_ID = DEFAULT_QWEN_ALIGNER_MODEL
 RUNTIME_PACKAGE = "mlx-qwen3-asr==0.3.5"
 
 
@@ -119,9 +121,21 @@ def _safe_progress_callback(
 class Qwen3Backend:
     name = BACKEND_NAME
 
-    def __init__(self, *, model_id: str, model_path: Path, verbose: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        model_id: str,
+        model_path: Path,
+        aligner_model_id: str = DEFAULT_ALIGNER_MODEL_ID,
+        aligner_path: Path | None = None,
+        aligner_snapshot: str | None = None,
+        verbose: bool = False,
+    ) -> None:
         self.model_id = model_id
         self.model_path = model_path
+        self.aligner_model_id = aligner_model_id
+        self.aligner_path = aligner_path
+        self.aligner_snapshot = aligner_snapshot
         self.verbose = verbose
 
     def transcribe(
@@ -132,6 +146,17 @@ class Qwen3Backend:
         profile_text: str | None,
         progress_callback: ProgressCallback | None = None,
     ) -> BackendResult:
+        aligner_metadata = {
+            "aligner_model": self.aligner_model_id,
+            "aligner_snapshot": self.aligner_snapshot,
+        }
+        if self.aligner_path is None:
+            raise BackendError(
+                "Qwen3 timestamp transcription requires a locally resolved forced "
+                "aligner; run download-model --asr qwen3 first",
+                metadata=aligner_metadata,
+            )
+
         on_progress = _safe_progress_callback(progress_callback)
         try:
             from mlx_qwen3_asr import transcribe
@@ -143,6 +168,7 @@ class Qwen3Backend:
                 context=profile_text or None,
                 return_timestamps=True,
                 return_chunks=True,
+                forced_aligner=str(self.aligner_path),
                 verbose=self.verbose,
                 on_progress=on_progress,
             )
@@ -154,6 +180,7 @@ class Qwen3Backend:
             segments = _segments_from_result(getattr(result, "chunks", None), timing_source="chunk")
 
         metadata = {
+            **aligner_metadata,
             "finish_reason": getattr(result, "finish_reason", None),
             "truncated": bool(getattr(result, "truncated", False)),
             "timestamp_source": "word" if segments and segments[0].timing_source == "model" else "chunk_or_none",

@@ -10,7 +10,10 @@ from meeting_recording_processor.asr.vibevoice import (
     MAX_DURATION_SECONDS,
     VibeVoiceBackend,
 )
-from meeting_recording_processor.errors import BackendError
+from meeting_recording_processor.config import (
+    DEFAULT_VIBEVOICE_ACOUSTIC_CHUNK_SIZE,
+)
+from meeting_recording_processor.errors import BackendError, ConfigurationError
 from meeting_recording_processor.progress import ProgressPhase
 
 
@@ -29,6 +32,10 @@ class FakeBatch(dict):
     def to(self, *args):
         self.to_args = args
         return self
+
+
+class FakeMpsOutOfMemoryError(RuntimeError):
+    pass
 
 
 class FakeProcessor:
@@ -73,6 +80,8 @@ class FakeProcessor:
 class FakeModel:
     from_pretrained_calls: list[tuple[str, dict]] = []
     to_calls: list[str] = []
+    generate_calls: list[dict] = []
+    generation_error: Exception | None = None
 
     def __init__(self, dtype: object) -> None:
         self.device = "cpu"
@@ -91,7 +100,10 @@ class FakeModel:
     def eval(self):
         return self
 
-    def generate(self, **_kwargs):
+    def generate(self, **kwargs):
+        self.generate_calls.append(kwargs)
+        if self.generation_error is not None:
+            raise self.generation_error
         return FakeTensor()
 
 
@@ -99,9 +111,14 @@ def fake_runtime(*, mps_available: bool = True) -> tuple[ModuleType, ModuleType]
     torch_module = ModuleType("torch")
     torch_module.__version__ = "2.test"
     torch_module.float32 = "torch.float32"
-    torch_module.backends = SimpleNamespace(
-        mps=SimpleNamespace(is_available=lambda: mps_available)
+    torch_module.OutOfMemoryError = FakeMpsOutOfMemoryError
+    mps_module = SimpleNamespace(
+        is_available=lambda: mps_available,
+        current_allocated_memory=lambda: 123,
+        driver_allocated_memory=lambda: 456,
     )
+    torch_module.backends = SimpleNamespace(mps=mps_module)
+    torch_module.mps = mps_module
     torch_module.inference_mode = nullcontext
 
     transformers_module = ModuleType("transformers")
@@ -117,6 +134,8 @@ class VibeVoiceTests(unittest.TestCase):
         FakeProcessor.request_calls.clear()
         FakeModel.from_pretrained_calls.clear()
         FakeModel.to_calls.clear()
+        FakeModel.generate_calls.clear()
+        FakeModel.generation_error = None
         FakeProcessor.raw_payload = [
             'assistant[{"Start":0.0,"End":5.2,"Speaker":0,"Content":"我哋今日開始開會。"}]'
         ]
@@ -177,6 +196,10 @@ class VibeVoiceTests(unittest.TestCase):
         self.assertEqual(result.metadata["language_mode"], "not_detected")
         self.assertEqual(result.metadata["requested_language"], "Cantonese")
         self.assertEqual(result.metadata["dtype"], "torch.float32")
+        self.assertEqual(
+            FakeModel.generate_calls[0]["acoustic_tokenizer_chunk_size"],
+            DEFAULT_VIBEVOICE_ACOUSTIC_CHUNK_SIZE,
+        )
         self.assertEqual(FakeModel.to_calls, ["mps"])
         self.assertEqual(
             FakeModel.from_pretrained_calls[0][1]["dtype"],
@@ -196,6 +219,70 @@ class VibeVoiceTests(unittest.TestCase):
         self.assertEqual(progress_events[0].phase, ProgressPhase.TRANSCRIBING.value)
         self.assertFalse(progress_events[0].determinate)
         self.assertIsNone(progress_events[0].percentage)
+
+    def test_configured_acoustic_chunk_size_reaches_generation(self) -> None:
+        torch_module, transformers_module = fake_runtime()
+        with patch.dict(
+            "sys.modules",
+            {"torch": torch_module, "transformers": transformers_module},
+        ):
+            VibeVoiceBackend(
+                model_id="microsoft/VibeVoice-ASR-HF",
+                model_path=self.model_path,
+                acoustic_tokenizer_chunk_size=32000,
+            ).transcribe(
+                self.audio,
+                language="Cantonese",
+                profile_text=None,
+            )
+
+        self.assertEqual(
+            FakeModel.generate_calls[0]["acoustic_tokenizer_chunk_size"],
+            32000,
+        )
+
+    def test_invalid_acoustic_chunk_size_is_rejected_before_model_load(self) -> None:
+        for value in (0, -3200, 65000):
+            with self.subTest(value=value):
+                with self.assertRaises(ConfigurationError):
+                    VibeVoiceBackend(
+                        model_id="microsoft/VibeVoice-ASR-HF",
+                        model_path=self.model_path,
+                        acoustic_tokenizer_chunk_size=value,
+                    )
+        self.assertEqual(FakeModel.from_pretrained_calls, [])
+
+    def test_generation_failure_preserves_runtime_and_memory_metadata(self) -> None:
+        FakeModel.generation_error = FakeMpsOutOfMemoryError("MPS out of memory")
+        torch_module, transformers_module = fake_runtime()
+        with patch.dict(
+            "sys.modules",
+            {"torch": torch_module, "transformers": transformers_module},
+        ):
+            with self.assertRaises(BackendError) as caught:
+                VibeVoiceBackend(
+                    model_id="microsoft/VibeVoice-ASR-HF",
+                    model_path=self.model_path,
+                    acoustic_tokenizer_chunk_size=32000,
+                ).transcribe(
+                    self.audio,
+                    language="Cantonese",
+                    profile_text=None,
+                )
+
+        metadata = caught.exception.metadata
+        self.assertEqual(metadata["device"], "mps")
+        self.assertEqual(metadata["dtype"], "torch.float32")
+        self.assertEqual(metadata["torch_version"], "2.test")
+        self.assertEqual(metadata["transformers_version"], "5.3.0")
+        self.assertEqual(metadata["model_id"], "microsoft/VibeVoice-ASR-HF")
+        self.assertEqual(metadata["model_snapshot"], "snapshot-test")
+        self.assertEqual(metadata["audio_duration_seconds"], 1.0)
+        self.assertFalse(metadata["context_provided"])
+        self.assertEqual(metadata["acoustic_tokenizer_chunk_size"], 32000)
+        self.assertEqual(metadata["failure_kind"], "mps_out_of_memory")
+        self.assertEqual(metadata["mps_current_allocated_memory_bytes"], 123)
+        self.assertEqual(metadata["mps_driver_allocated_memory_bytes"], 456)
 
     def test_malformed_record_rejects_all_model_timing_but_keeps_full_text(self) -> None:
         FakeProcessor.parsed_payload = [

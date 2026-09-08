@@ -9,8 +9,10 @@ import sys
 
 from .config import (
     AsrMode,
+    DEFAULT_QWEN_ALIGNER_MODEL,
     DEFAULT_QWEN_MODEL,
     DEFAULT_SENSEVOICE_MODEL,
+    DEFAULT_VIBEVOICE_ACOUSTIC_CHUNK_SIZE,
     DEFAULT_VIBEVOICE_MODEL,
     ExportConfig,
     ExtractConfig,
@@ -42,8 +44,15 @@ def _add_transcription_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--work-dir", type=Path)
     parser.add_argument("--cache-dir", type=Path)
     parser.add_argument("--qwen-model", default=DEFAULT_QWEN_MODEL)
+    parser.add_argument("--qwen-aligner-model", default=DEFAULT_QWEN_ALIGNER_MODEL)
     parser.add_argument("--sensevoice-model", default=DEFAULT_SENSEVOICE_MODEL)
     parser.add_argument("--vibevoice-model", default=DEFAULT_VIBEVOICE_MODEL)
+    parser.add_argument(
+        "--vibevoice-acoustic-chunk-size",
+        type=int,
+        default=DEFAULT_VIBEVOICE_ACOUSTIC_CHUNK_SIZE,
+        help="VibeVoice acoustic tokenizer chunk size in 24 kHz samples",
+    )
     parser.add_argument("--keep-work-files", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--verbose", action="store_true")
@@ -85,6 +94,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor_parser = subparsers.add_parser("doctor", help="檢查平台、依賴同 model cache")
     doctor_parser.add_argument("--cache-dir", type=Path)
+    doctor_parser.add_argument("--qwen-model", default=DEFAULT_QWEN_MODEL)
+    doctor_parser.add_argument("--qwen-aligner-model", default=DEFAULT_QWEN_ALIGNER_MODEL)
     doctor_parser.add_argument("--json", action="store_true", dest="as_json")
 
     download_parser = subparsers.add_parser(
@@ -97,6 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     download_parser.add_argument("--cache-dir", type=Path)
     download_parser.add_argument("--qwen-model", default=DEFAULT_QWEN_MODEL)
+    download_parser.add_argument("--qwen-aligner-model", default=DEFAULT_QWEN_ALIGNER_MODEL)
     download_parser.add_argument("--sensevoice-model", default=DEFAULT_SENSEVOICE_MODEL)
     download_parser.add_argument("--vibevoice-model", default=DEFAULT_VIBEVOICE_MODEL)
 
@@ -156,8 +168,10 @@ def _run_extract(args: argparse.Namespace) -> int:
             language=args.language,
             context_file=context_file,
             qwen_model=args.qwen_model,
+            qwen_aligner_model=args.qwen_aligner_model,
             sensevoice_model=args.sensevoice_model,
             vibevoice_model=args.vibevoice_model,
+            vibevoice_acoustic_chunk_size=args.vibevoice_acoustic_chunk_size,
             keep_work_files=args.keep_work_files,
             overwrite=args.overwrite,
             verbose=args.verbose,
@@ -211,8 +225,10 @@ def _run_batch(args: argparse.Namespace) -> int:
                     language=args.language,
                     context_file=context_file,
                     qwen_model=args.qwen_model,
+                    qwen_aligner_model=args.qwen_aligner_model,
                     sensevoice_model=args.sensevoice_model,
                     vibevoice_model=args.vibevoice_model,
+                    vibevoice_acoustic_chunk_size=args.vibevoice_acoustic_chunk_size,
                     keep_work_files=args.keep_work_files,
                     overwrite=args.overwrite,
                     verbose=args.verbose,
@@ -256,7 +272,11 @@ def _run_export(args: argparse.Namespace) -> int:
 def _run_doctor(args: argparse.Namespace) -> int:
     root = project_root()
     cache_dir = (args.cache_dir or root / ".cache/huggingface").expanduser()
-    report = doctor_report(cache_dir)
+    report = doctor_report(
+        cache_dir,
+        qwen_model=args.qwen_model,
+        qwen_aligner_model=args.qwen_aligner_model,
+    )
     if args.as_json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
@@ -291,6 +311,7 @@ def _run_download(args: argparse.Namespace) -> int:
     targets: list[tuple[str, str]] = []
     if args.asr in {"qwen3", "all"}:
         targets.append(("qwen3", args.qwen_model))
+        targets.append(("qwen3-aligner", args.qwen_aligner_model))
     if args.asr in {"sensevoice", "all"}:
         targets.append(("sensevoice", args.sensevoice_model))
     if args.asr in {"vibevoice", "all"}:

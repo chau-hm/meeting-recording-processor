@@ -10,7 +10,12 @@ from typing import Any, Callable
 
 from .asr import Qwen3Backend, SenseVoiceBackend, VibeVoiceBackend
 from .asr.vibevoice import TARGET_SAMPLE_RATE as VIBEVOICE_SAMPLE_RATE
-from .config import AsrMode, ExtractConfig, SUPPORTED_EXTENSIONS
+from .config import (
+    DEFAULT_VIBEVOICE_ACOUSTIC_CHUNK_SIZE,
+    AsrMode,
+    ExtractConfig,
+    SUPPORTED_EXTENSIONS,
+)
 from .errors import ConfigurationError, OutputExistsError, TranscriptionFailed
 from .manifest import new_run_id, sha256_file, tool_metadata, utc_now_iso
 from .media.normalize import normalize_audio
@@ -33,7 +38,7 @@ class ExtractResult:
     warnings: tuple[str, ...]
 
 
-BackendFactory = Callable[[str, str, Path, bool], Any]
+BackendFactory = Callable[..., Any]
 ModelResolver = Callable[[str, Path], ResolvedModel]
 ProgressFactory = Callable[[ExtractConfig], ProgressReporter]
 
@@ -43,14 +48,38 @@ def default_progress_factory(config: ExtractConfig) -> ProgressReporter:
 
 
 def default_backend_factory(
-    backend: str, model_id: str, model_path: Path, verbose: bool
+    backend: str,
+    model_id: str,
+    model_path: Path,
+    verbose: bool,
+    *,
+    qwen_aligner_model_id: str | None = None,
+    qwen_aligner_path: Path | None = None,
+    qwen_aligner_snapshot: str | None = None,
+    vibevoice_acoustic_tokenizer_chunk_size: int = DEFAULT_VIBEVOICE_ACOUSTIC_CHUNK_SIZE,
 ):
     if backend == AsrMode.QWEN3.value:
-        return Qwen3Backend(model_id=model_id, model_path=model_path, verbose=verbose)
+        if qwen_aligner_model_id is None or qwen_aligner_path is None:
+            raise ConfigurationError(
+                "Qwen3 requires a locally resolved forced aligner before inference"
+            )
+        return Qwen3Backend(
+            model_id=model_id,
+            model_path=model_path,
+            aligner_model_id=qwen_aligner_model_id,
+            aligner_path=qwen_aligner_path,
+            aligner_snapshot=qwen_aligner_snapshot,
+            verbose=verbose,
+        )
     if backend == AsrMode.SENSEVOICE.value:
         return SenseVoiceBackend(model_id=model_id, model_path=model_path, verbose=verbose)
     if backend == AsrMode.VIBEVOICE.value:
-        return VibeVoiceBackend(model_id=model_id, model_path=model_path, verbose=verbose)
+        return VibeVoiceBackend(
+            model_id=model_id,
+            model_path=model_path,
+            acoustic_tokenizer_chunk_size=vibevoice_acoustic_tokenizer_chunk_size,
+            verbose=verbose,
+        )
     raise ConfigurationError(f"未知 ASR backend：{backend}")
 
 
@@ -152,9 +181,16 @@ class Extractor:
                 started_at = utc_now_iso()
                 started = perf_counter()
                 resolved: ResolvedModel | None = None
+                auxiliary_resolved: ResolvedModel | None = None
                 backend_result: BackendResult | None = None
                 error: str | None = None
                 error_metadata: dict[str, Any] = {}
+                if backend_name == AsrMode.QWEN3.value:
+                    error_metadata["aligner_model"] = config.qwen_aligner_model
+                if backend_name == AsrMode.VIBEVOICE.value:
+                    error_metadata[
+                        "acoustic_tokenizer_chunk_size"
+                    ] = config.vibevoice_acoustic_chunk_size
                 error_warnings: tuple[str, ...] = ()
                 try:
                     if index == 1:
@@ -163,8 +199,30 @@ class Extractor:
                             message=f"Loading {backend_name} model...",
                         )
                     resolved = self.model_resolver(model_id, cache_dir)
+                    factory_kwargs: dict[str, Any] = {}
+                    if backend_name == AsrMode.QWEN3.value:
+                        auxiliary_resolved = self.model_resolver(
+                            config.qwen_aligner_model,
+                            cache_dir,
+                        )
+                        factory_kwargs = {
+                            "qwen_aligner_model_id": config.qwen_aligner_model,
+                            "qwen_aligner_path": auxiliary_resolved.path,
+                            "qwen_aligner_snapshot": auxiliary_resolved.snapshot,
+                        }
+                        error_metadata["aligner_snapshot"] = auxiliary_resolved.snapshot
+                    elif backend_name == AsrMode.VIBEVOICE.value:
+                        factory_kwargs = {
+                            "vibevoice_acoustic_tokenizer_chunk_size": (
+                                config.vibevoice_acoustic_chunk_size
+                            )
+                        }
                     backend = self.backend_factory(
-                        backend_name, model_id, resolved.path, config.verbose
+                        backend_name,
+                        model_id,
+                        resolved.path,
+                        config.verbose,
+                        **factory_kwargs,
                     )
                     backend_result = backend.transcribe(
                         normalized_path,
@@ -181,7 +239,8 @@ class Extractor:
                 except Exception as exc:
                     error = str(exc)
                     metadata = getattr(exc, "metadata", {})
-                    error_metadata = metadata if isinstance(metadata, dict) else {}
+                    if isinstance(metadata, dict):
+                        error_metadata.update(metadata)
                     warnings = getattr(exc, "warnings", ())
                     error_warnings = warnings if isinstance(warnings, tuple) else ()
                     quality = inspect_text(
@@ -391,9 +450,13 @@ class Extractor:
                 "context_sha256": self.file_hasher(context_file) if context_file else None,
                 "models": {
                     "qwen3": config.qwen_model,
+                    "qwen3_aligner": config.qwen_aligner_model,
                     "sensevoice": config.sensevoice_model,
                     "vibevoice": config.vibevoice_model,
                 },
+                "vibevoice_acoustic_tokenizer_chunk_size": (
+                    config.vibevoice_acoustic_chunk_size
+                ),
                 "offline": True,
             },
             "attempts": [attempt.to_dict() for attempt in attempts],

@@ -13,10 +13,12 @@ Apple Silicon 上完全本機運行嘅廣東話會議轉錄工具。輸入錄音
 - Python 3.11–3.13、`uv`、system `ffmpeg`／`ffprobe`
 - `.m4a`、`.mp3`、`.wav`、`.flac`、`.mp4`、`.mov`
 - 影片只讀 audio stream；唔分析畫面、唔做 OCR
-- `qwen3`：`mlx-qwen3-asr==0.3.5` + `Qwen/Qwen3-ASR-1.7B`
+- `qwen3`：`mlx-qwen3-asr==0.3.5` + `Qwen/Qwen3-ASR-1.7B` +
+  `Qwen/Qwen3-ForcedAligner-0.6B`（timestamp path required）
 - `sensevoice`：`mlx-audio==0.4.1` + `mlx-community/SenseVoiceSmall`
 - `vibevoice`：native `transformers>=5.3.0,<5.4.0` + `microsoft/VibeVoice-ASR-HF`
-  （24 kHz、MPS、FP32、目前最多單次 60 分鐘；explicit evaluation backend）
+  （24 kHz、MPS、FP32、目前最多單次 60 分鐘、預設
+  `acoustic_tokenizer_chunk_size=64000`；explicit evaluation backend）
 - runtime 一律 offline；只有明確執行 `download-model` 先會連網
 - 保留廣東話／中英夾雜，canonical output 以 OpenCC `s2hk` 轉為香港繁體，唔翻譯或改寫內容
 
@@ -33,7 +35,10 @@ chmod +x setup.sh scripts/*.sh
 ./scripts/doctor.sh
 ```
 
-`setup.sh` 建立 `.venv`；model 下載到 project-local `.cache/huggingface/`。模型下載完成後，`extract` 只會讀 local cache，缺少 asset 時會 fail closed。
+`setup.sh` 建立 `.venv`；model 下載到 project-local `.cache/huggingface/`。Qwen3
+timestamp transcription 需要 ASR model 同 forced aligner；`download-model --asr qwen3`
+會一次下載完整兩個 asset；`download-model --asr all` 亦會包括兩個 Qwen asset。模型下載完成
+後，`extract` 只會讀 local cache，缺少 asset 時會 fail closed。
 VibeVoice model 較大；`./scripts/download-models.sh` 會連同三個支援 model family 一次下載。
 
 ## 使用方法
@@ -52,10 +57,15 @@ uv run mrp extract /path/to/meeting.m4a --asr vibevoice
 ```
 
 VibeVoice 需要 Apple Silicon MPS，輸入會保留為 24 kHz，現時 verified MPS path 使用 FP32；
+預設 acoustic tokenizer chunk size 係 `64000` samples；可按實機 memory test 用
+`--vibevoice-acoustic-chunk-size` 調整（必須係正整數及 3200 倍數）。較細 tokenizer chunk
+會降低 tokenizer peak memory，但唔保證所有長錄音都適合 unified memory，因為 language-model
+context memory 仍然會增長；
 大型 model 可能需要比 checkpoint on-disk／BF16 size 多得多嘅 unified memory，唔會自動
 fallback 到 CPU。`--language` 只保留喺 request／attempt metadata，VibeVoice 唔用佢做
 conditioning 或 language detection，所以 canonical transcript language 會係 `und`；原生
 speaker/timestamp information 會保留喺 attempt metadata，但 canonical transcript 暫時唔啟用 diarization。
+Project 唔會停用 PyTorch MPS high-watermark protection。
 
 確認 JSON 後，先另外 export：
 
@@ -87,6 +97,10 @@ Batch 會按檔名排序，並喺第一個檔案開始前預先檢查全部 stem
 # 明確只用 Qwen3；失敗時絕不靜默 fallback
 uv run mrp extract meeting.wav --asr qwen3
 
+# VibeVoice memory tuning（explicit backend；預設 64000 samples）
+uv run mrp extract meeting.wav --asr vibevoice \
+  --vibevoice-acoustic-chunk-size 64000
+
 # 人手指定 SenseVoice 重試，寫入另一個 output directory
 uv run mrp extract meeting.wav --asr sensevoice --output-dir output/sensevoice-retry
 
@@ -99,8 +113,11 @@ uv run mrp doctor
 uv run mrp cache-size
 ```
 
-`doctor` 會將 `torch`／`transformers` package presence 同 `runtime:vibevoice-mps`
-分開列出；package 裝咗唔代表 MPS 可用，MPS unavailable 時整體 `healthy` 會係 false。
+`doctor` 會將 `model:qwen3` 同 `model:qwen3-aligner` 分開列出，亦會將
+`torch`／`transformers` package presence 同 `runtime:vibevoice-mps` 分開列出；
+package 裝咗唔代表 MPS 可用，MPS unavailable 或 Qwen 任一 asset 缺失時整體 `healthy`
+會係 false。使用自訂 Qwen asset IDs 時，`doctor` 同 `extract`／`download-model` 一樣可用
+`--qwen-model` 同 `--qwen-aligner-model`。
 預設 context 係 `profiles/generic.txt`。LOQ vocabulary 只係 opt-in example，核心程式冇 hard-code domain data。
 
 ## 轉錄進度
@@ -154,7 +171,7 @@ Fallback 例子：
 - 非空白字元超過 90% 係 Unicode 標點或符號；
 - active audio 至少 10 秒，但 substantive 字元少過 3 個。
 
-一般專有名詞、accuracy、標點或分段質素問題唔會自動 fallback。每個 attempt 嘅 raw text、raw segments、model snapshot、quality report、錯誤同 runtime 都保留喺同一 transcript JSON，唔會融合或覆蓋。
+一般專有名詞、accuracy、標點或分段質素問題唔會自動 fallback。每個 attempt 嘅 raw text、raw segments、model snapshot、quality report、錯誤同 runtime 都保留喺同一 transcript JSON，唔會融合或覆蓋。Qwen attempt 另外保留 `aligner_model` 同 `aligner_snapshot`；VibeVoice failure 會先保存 device、dtype、runtime versions、audio duration、chunk size 同可用嘅 numeric MPS memory diagnostics。
 明確 `--asr vibevoice` 只執行 VibeVoice；失敗會寫出 diagnostic JSON，絕不靜默改用 Qwen3 或 SenseVoice。
 
 ## Output contract

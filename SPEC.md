@@ -37,7 +37,7 @@
 
 | Mode | Runtime/model | 行為 |
 |---|---|---|
-| `qwen3` | `mlx-qwen3-asr==0.3.5`, `Qwen/Qwen3-ASR-1.7B` | 單一 attempt；失敗不 fallback |
+| `qwen3` | `mlx-qwen3-asr==0.3.5`, `Qwen/Qwen3-ASR-1.7B` + `Qwen/Qwen3-ForcedAligner-0.6B` | 單一 attempt；timestamp path 需要兩個 local assets；失敗不 fallback |
 | `sensevoice` | `mlx-audio==0.4.1`, `mlx-community/SenseVoiceSmall` | 單一 attempt；30 秒 chunk inference |
 | `vibevoice` | `torch`, `transformers>=5.3.0,<5.4.0`, `microsoft/VibeVoice-ASR-HF` | explicit evaluation；MPS、24 kHz、FP32、最多 60 分鐘；失敗不 fallback |
 | `auto` | Qwen3 + SenseVoice | 先 Qwen3；只因 hard failure fallback；不包括 VibeVoice |
@@ -58,6 +58,8 @@ Qwen3 attempt 符合任一條件時，`auto` 先執行 SenseVoice：
 ### FR-05 Offline and models
 
 - `extract` 固定設定 Hugging Face offline mode，並以 `local_files_only=True` resolve model。
+- Qwen3 timestamp path 明確 preflight ASR model 同 forced aligner；`download-model --asr qwen3`
+  同 `--asr all` 會下載完整兩個 model snapshots，extract 唔會由 timestamp runtime 隱藏下載 aligner。
 - 缺少 snapshot 時提示先執行 `download-model`，不使用 cloud API 或其他 model。
 - 只有 `download-model` command 可啟用 network 下載。
 - 預設 cache 為 `<project>/.cache/huggingface/`；cache path 同 snapshot id 寫入 provenance。
@@ -132,8 +134,10 @@ mrp extract INPUT
   [--work-dir PATH]
   [--cache-dir PATH]
   [--qwen-model MODEL_ID]
+  [--qwen-aligner-model MODEL_ID]
   [--sensevoice-model MODEL_ID]
   [--vibevoice-model MODEL_ID]
+  [--vibevoice-acoustic-chunk-size SAMPLES]
   [--keep-work-files]
   [--overwrite]
   [--verbose]
@@ -146,7 +150,7 @@ mrp export TRANSCRIPT_JSON
   [--output-dir PATH]
   [--overwrite]
 
-mrp doctor [--cache-dir PATH] [--json]
+mrp doctor [--cache-dir PATH] [--qwen-model MODEL_ID] [--qwen-aligner-model MODEL_ID] [--json]
 mrp download-model [--asr qwen3|sensevoice|vibevoice|all] [model/cache overrides]
 mrp cache-size [--cache-dir PATH]
 ```
@@ -189,7 +193,9 @@ Normative machine-readable schema：`schemas/transcript-v1.schema.json`。
 
 - **Privacy：** runtime 不 upload media、transcript、context 或 metadata。
 - **Auditability：** model id/snapshot、attempt raw output、fallback reason、版本、hash 可追溯。
-- **VibeVoice runtime readiness：** `doctor` 分開報告 `torch`／`transformers` package presence 同 `torch.backends.mps.is_available()`；MPS unavailable 時 `healthy` 為 false。
+- **VibeVoice runtime readiness：** `doctor` 分開報告 `torch`／`transformers` package presence 同 `torch.backends.mps.is_available()`；MPS unavailable 時 `healthy` 為 false。VibeVoice path 固定 MPS/FP32/24 kHz、最多 60 分鐘，預設 `acoustic_tokenizer_chunk_size=64000`；CLI override 必須係正整數及 3200 倍數。較細 tokenizer chunks 只降低 tokenizer peak memory，不保證 language-model/context memory 對所有長錄音都足夠；project 不會停用 MPS high-watermark protection。
+- **Qwen timestamp readiness：** `doctor` 分開報告 `model:qwen3` 同 `model:qwen3-aligner`；任一 asset 缺失都唔算 healthy。每個成功 attempt 保存 `aligner_model`／`aligner_snapshot`。
+- **Failure provenance：** VibeVoice model loading/generation failure 先保存 device、dtype、PyTorch/Transformers versions、model identity/snapshot、audio duration、context presence、chunk size，同 pinned PyTorch public API 提供嘅 numeric MPS memory telemetry（如有）。
 - **Determinism：** media parameters、post-processing、quality thresholds 固定。
 - **Safety：** input immutable、output fail-on-collision、atomic write、scoped work cleanup。
 - **Testability：** platform/media/model/backend 全部可注入 fake；unit tests 無需大型 model。

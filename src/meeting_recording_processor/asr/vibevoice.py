@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Any
 import wave
 
+from ..config import (
+    DEFAULT_VIBEVOICE_ACOUSTIC_CHUNK_SIZE,
+    validate_vibevoice_acoustic_chunk_size,
+)
 from ..errors import BackendError
 from ..progress import ProgressEvent, ProgressPhase
 from ..schemas import BackendResult, TranscriptSegment
@@ -168,6 +172,35 @@ def _mps_available(torch_module: Any) -> bool:
         return False
 
 
+def _mps_memory_metadata(torch_module: Any) -> dict[str, int]:
+    mps = getattr(torch_module, "mps", None)
+    if mps is None:
+        return {}
+
+    metadata: dict[str, int] = {}
+    for method_name, metadata_name in (
+        ("current_allocated_memory", "mps_current_allocated_memory_bytes"),
+        ("driver_allocated_memory", "mps_driver_allocated_memory_bytes"),
+    ):
+        try:
+            method = getattr(mps, method_name)
+            value = int(method())
+        except Exception:
+            # Best-effort telemetry must never mask the original ASR failure.
+            continue
+        if value >= 0:
+            metadata[metadata_name] = value
+    return metadata
+
+
+def _is_mps_out_of_memory(exc: Exception, torch_module: Any) -> bool:
+    out_of_memory_error = getattr(torch_module, "OutOfMemoryError", None)
+    return (
+        isinstance(out_of_memory_error, type)
+        and isinstance(exc, out_of_memory_error)
+    )
+
+
 class VibeVoiceBackend:
     name = BACKEND_NAME
 
@@ -176,10 +209,14 @@ class VibeVoiceBackend:
         *,
         model_id: str,
         model_path: Path,
+        acoustic_tokenizer_chunk_size: int = DEFAULT_VIBEVOICE_ACOUSTIC_CHUNK_SIZE,
         verbose: bool = False,
     ) -> None:
         self.model_id = model_id
         self.model_path = model_path
+        self.acoustic_tokenizer_chunk_size = validate_vibevoice_acoustic_chunk_size(
+            acoustic_tokenizer_chunk_size
+        )
         self.verbose = verbose
 
     def transcribe(
@@ -191,18 +228,38 @@ class VibeVoiceBackend:
         progress_callback: ProgressCallback | None = None,
     ) -> BackendResult:
         duration = _wav_duration(audio_path)
+        base_metadata: dict[str, object] = {
+            "device": "mps",
+            "dtype": "torch.float32",
+            "torch_version": None,
+            "transformers_version": None,
+            "model_id": self.model_id,
+            "model_snapshot": _snapshot_from_path(self.model_path),
+            "audio_duration_seconds": duration,
+            "context_provided": bool(profile_text),
+            "acoustic_tokenizer_chunk_size": self.acoustic_tokenizer_chunk_size,
+        }
         if duration is not None and duration > MAX_DURATION_SECONDS:
             raise BackendError(
                 "VibeVoice 目前只支援單次最多 60 分鐘音訊；"
-                f"normalized WAV 長度為 {duration / 60:.1f} 分鐘"
+                f"normalized WAV 長度為 {duration / 60:.1f} 分鐘",
+                metadata=base_metadata,
             )
 
         try:
             torch_module = importlib.import_module("torch")
         except ImportError as exc:
-            raise BackendError("VibeVoice 需要 PyTorch；請重新執行 uv sync") from exc
+            raise BackendError(
+                "VibeVoice 需要 PyTorch；請重新執行 uv sync",
+                metadata=base_metadata,
+            ) from exc
+        base_metadata["torch_version"] = getattr(torch_module, "__version__", None)
+        base_metadata["dtype"] = str(getattr(torch_module, "float32", "torch.float32"))
         if not _mps_available(torch_module):
-            raise BackendError("VibeVoice 需要可用嘅 Apple Silicon MPS backend")
+            raise BackendError(
+                "VibeVoice 需要可用嘅 Apple Silicon MPS backend",
+                metadata=base_metadata,
+            )
 
         try:
             transformers = importlib.import_module("transformers")
@@ -210,8 +267,10 @@ class VibeVoiceBackend:
             model_class = getattr(transformers, "VibeVoiceAsrForConditionalGeneration")
         except (ImportError, AttributeError) as exc:
             raise BackendError(
-                "VibeVoice 需要 transformers>=5.3.0,<5.4.0 原生 ASR API"
+                "VibeVoice 需要 transformers>=5.3.0,<5.4.0 原生 ASR API",
+                metadata=base_metadata,
             ) from exc
+        base_metadata["transformers_version"] = getattr(transformers, "__version__", None)
 
         try:
             mps_dtype = torch_module.float32
@@ -230,14 +289,23 @@ class VibeVoiceBackend:
             if dtype is None or str(dtype) != str(mps_dtype):
                 raise BackendError(
                     "VibeVoice MPS path requires torch.float32; "
-                    f"loaded dtype was {dtype}"
+                    f"loaded dtype was {dtype}",
+                    metadata=base_metadata,
                 )
         except Exception as exc:
-            raise BackendError(f"VibeVoice model 載入失敗：{exc}") from exc
+            raise BackendError(
+                f"VibeVoice model 載入失敗：{exc}",
+                metadata=base_metadata,
+            ) from exc
 
         device = getattr(model, "device", "mps")
+        base_metadata["device"] = str(device)
+        base_metadata["dtype"] = str(dtype) if dtype is not None else None
         if not str(device).startswith("mps"):
-            raise BackendError(f"VibeVoice 未能使用 MPS device：{device}")
+            raise BackendError(
+                f"VibeVoice 未能使用 MPS device：{device}",
+                metadata=base_metadata,
+            )
 
         report_progress = isolate_progress_callback(progress_callback)
         if report_progress is not None:
@@ -260,15 +328,28 @@ class VibeVoiceBackend:
             inference_mode = getattr(torch_module, "inference_mode", None)
             context = inference_mode() if callable(inference_mode) else nullcontext()
             with context:
-                output_ids = model.generate(**inputs)
+                output_ids = model.generate(
+                    **inputs,
+                    acoustic_tokenizer_chunk_size=self.acoustic_tokenizer_chunk_size,
+                )
             generated_ids = output_ids[:, input_length:]
         except Exception as exc:
-            raise BackendError(f"VibeVoice transcription 失敗：{exc}") from exc
+            failure_metadata = dict(base_metadata)
+            if _is_mps_out_of_memory(exc, torch_module):
+                failure_metadata["failure_kind"] = "mps_out_of_memory"
+            failure_metadata.update(_mps_memory_metadata(torch_module))
+            raise BackendError(
+                f"VibeVoice transcription 失敗：{exc}",
+                metadata=failure_metadata,
+            ) from exc
 
         try:
             raw_output = _first_text(processor.decode(generated_ids))
         except Exception as exc:
-            raise BackendError(f"VibeVoice raw output decode 失敗：{exc}") from exc
+            raise BackendError(
+                f"VibeVoice raw output decode 失敗：{exc}",
+                metadata=base_metadata,
+            ) from exc
 
         warnings = [_SPEAKER_METADATA_WARNING, _LANGUAGE_METADATA_WARNING]
         parsed_decoded: object = None
@@ -291,14 +372,8 @@ class VibeVoiceBackend:
                 "post-processing will estimate timing from the complete text"
             )
 
-        metadata = {
-            "device": str(device),
-            "dtype": str(dtype) if dtype is not None else None,
-            "torch_version": getattr(torch_module, "__version__", None),
-            "transformers_version": getattr(transformers, "__version__", None),
-            "model_id": self.model_id,
-            "model_snapshot": _snapshot_from_path(self.model_path),
-            "context_provided": bool(profile_text),
+        metadata: dict[str, object] = {
+            **base_metadata,
             "language_mode": "not_detected",
             "requested_language": language,
             "raw_output": raw_output,

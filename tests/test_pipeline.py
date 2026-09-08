@@ -1,4 +1,5 @@
 from pathlib import Path
+from dataclasses import replace
 from io import StringIO
 import sys
 import tempfile
@@ -7,8 +8,16 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from meeting_recording_processor.asr.qwen3 import Qwen3Backend
-from meeting_recording_processor.config import AsrMode, ExtractConfig
-from meeting_recording_processor.errors import BackendError, TranscriptionFailed
+from meeting_recording_processor.config import (
+    DEFAULT_QWEN_ALIGNER_MODEL,
+    AsrMode,
+    ExtractConfig,
+)
+from meeting_recording_processor.errors import (
+    BackendError,
+    ModelUnavailableError,
+    TranscriptionFailed,
+)
 from meeting_recording_processor.media.probe import AudioStream, MediaMetadata
 from meeting_recording_processor.media.signal import AudioSignalStats
 from meeting_recording_processor.models import ResolvedModel
@@ -99,6 +108,7 @@ class PipelineTests(unittest.TestCase):
         self.input = self.root / "meeting.m4a"
         self.input.write_bytes(b"private fixture bytes")
         self.normalization_rates: list[int] = []
+        self.backend_kwargs: dict[str, dict] = {}
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -109,6 +119,7 @@ class PipelineTests(unittest.TestCase):
         *,
         media_duration: float | None = 5.0,
         progress_factory=None,
+        model_resolver=None,
     ) -> Extractor:
         metadata = MediaMetadata(
             "mov,mp4,m4a",
@@ -126,7 +137,8 @@ class PipelineTests(unittest.TestCase):
         def resolver(model_id, _cache):
             return ResolvedModel(model_id, self.root / "model", "snapshot-test")
 
-        def factory(name, _model_id, _model_path, _verbose):
+        def factory(name, _model_id, _model_path, _verbose, **kwargs):
+            self.backend_kwargs[name] = kwargs
             return backends[name]
 
         extractor = Extractor(
@@ -135,7 +147,7 @@ class PipelineTests(unittest.TestCase):
             probe=lambda _path: metadata,
             normalizer=normalizer,
             signal_analyzer=lambda _path: signal,
-            model_resolver=resolver,
+            model_resolver=model_resolver or resolver,
             backend_factory=factory,
             postprocessor=lambda backend_result, audio_duration: postprocess_result(
                 backend_result, audio_duration=audio_duration, converter=lambda value: value
@@ -195,6 +207,30 @@ class PipelineTests(unittest.TestCase):
         package = load_package(caught.exception.diagnostic_path)
         self.assertEqual(package["status"], "failed")
 
+    def test_missing_qwen_aligner_fails_before_backend_inference(self) -> None:
+        qwen = FakeBackend(result("qwen3", "不應執行。"))
+        config = self.config(AsrMode.QWEN3)
+        resolved_ids: list[str] = []
+
+        def resolver(model_id, _cache):
+            resolved_ids.append(model_id)
+            if model_id == DEFAULT_QWEN_ALIGNER_MODEL:
+                raise ModelUnavailableError(
+                    f"本機 cache 未有完整 model：{model_id}；請先執行 download-model"
+                )
+            return ResolvedModel(model_id, self.root / "model", "snapshot-test")
+
+        with self.assertRaises(TranscriptionFailed) as caught:
+            self.extractor(
+                {"qwen3": qwen},
+                model_resolver=resolver,
+            ).extract(config)
+
+        package = load_package(caught.exception.diagnostic_path)
+        self.assertEqual(resolved_ids, [config.qwen_model, config.qwen_aligner_model])
+        self.assertEqual(qwen.calls, 0)
+        self.assertIn(config.qwen_aligner_model, package["attempts"][0]["error"])
+
     def test_explicit_vibevoice_does_not_fallback_to_existing_backends(self) -> None:
         vibevoice = FakeBackend(result("vibevoice", "VibeVoice transcript"))
         qwen = FakeBackend(result("qwen3", "不應執行。"))
@@ -212,6 +248,20 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(package["attempts"][0]["metadata"]["requested_language"], "Cantonese")
         self.assertEqual(package["attempts"][0]["metadata"]["language_mode"], "not_detected")
         self.assertEqual(package["transcript"]["language"], "und")
+
+    def test_vibevoice_chunk_size_config_reaches_backend_factory(self) -> None:
+        vibevoice = FakeBackend(result("vibevoice", "VibeVoice transcript"))
+        config = replace(
+            self.config(AsrMode.VIBEVOICE),
+            vibevoice_acoustic_chunk_size=32000,
+        )
+        self.extractor({"vibevoice": vibevoice}).extract(config)
+        self.assertEqual(
+            self.backend_kwargs["vibevoice"][
+                "vibevoice_acoustic_tokenizer_chunk_size"
+            ],
+            32000,
+        )
 
     def test_vibevoice_rejected_timing_preserves_complete_text_for_estimation(self) -> None:
         transcript_text = "第一段。 中間段落。 第三段。"
@@ -275,6 +325,15 @@ class PipelineTests(unittest.TestCase):
                 metadata={
                     "raw_output": raw_output,
                     "structured_parse_valid": False,
+                    "device": "mps",
+                    "dtype": "torch.float32",
+                    "torch_version": "2.test",
+                    "transformers_version": "5.3.0",
+                    "model_id": "microsoft/VibeVoice-ASR-HF",
+                    "model_snapshot": "snapshot-test",
+                    "audio_duration_seconds": 2031.0,
+                    "context_provided": False,
+                    "acoustic_tokenizer_chunk_size": 64000,
                 },
                 warnings=("structured timing rejected",),
             )
@@ -289,6 +348,13 @@ class PipelineTests(unittest.TestCase):
         attempt = package["attempts"][0]
         self.assertEqual(attempt["metadata"]["raw_output"], raw_output)
         self.assertFalse(attempt["metadata"]["structured_parse_valid"])
+        self.assertEqual(attempt["metadata"]["device"], "mps")
+        self.assertEqual(attempt["metadata"]["dtype"], "torch.float32")
+        self.assertEqual(attempt["metadata"]["torch_version"], "2.test")
+        self.assertEqual(attempt["metadata"]["transformers_version"], "5.3.0")
+        self.assertEqual(attempt["metadata"]["model_snapshot"], "snapshot-test")
+        self.assertEqual(attempt["metadata"]["audio_duration_seconds"], 2031.0)
+        self.assertEqual(attempt["metadata"]["acoustic_tokenizer_chunk_size"], 64000)
         self.assertEqual(attempt["warnings"], ["structured timing rejected"])
 
     def test_backend_exception_is_preserved_before_fallback(self) -> None:
@@ -459,10 +525,21 @@ class PipelineTests(unittest.TestCase):
             raise BrokenPipeError("closed stderr")
 
         module = SimpleNamespace(transcribe=fake_transcribe)
+        aligner_path = self.root / "aligner"
+        captured_kwargs: dict[str, object] = {}
+
+        def capture_transcribe(_audio_path: str, **kwargs):
+            captured_kwargs.update(kwargs)
+            return fake_transcribe(_audio_path, **kwargs)
+
+        module.transcribe = capture_transcribe
         with patch.dict(sys.modules, {"mlx_qwen3_asr": module}):
             backend_result = Qwen3Backend(
                 model_id="test/qwen3",
                 model_path=self.root / "model",
+                aligner_model_id=DEFAULT_QWEN_ALIGNER_MODEL,
+                aligner_path=aligner_path,
+                aligner_snapshot="aligner-snapshot",
             ).transcribe(
                 self.input,
                 language="Cantonese",
@@ -471,6 +548,12 @@ class PipelineTests(unittest.TestCase):
             )
 
         self.assertEqual(backend_result.text, transcript)
+        self.assertEqual(captured_kwargs["forced_aligner"], str(aligner_path))
+        self.assertEqual(
+            backend_result.metadata["aligner_model"],
+            DEFAULT_QWEN_ALIGNER_MODEL,
+        )
+        self.assertEqual(backend_result.metadata["aligner_snapshot"], "aligner-snapshot")
 
 
 if __name__ == "__main__":
