@@ -7,7 +7,7 @@ import unicodedata
 from collections.abc import Callable, Iterable
 
 from .errors import BackendError
-from .schemas import BackendResult, TranscriptSegment
+from .schemas import MIN_SEGMENT_DURATION, BackendResult, TranscriptSegment
 
 
 _SPACE_RE = re.compile(r"[ \t\f\v]+")
@@ -94,7 +94,7 @@ def _estimate_segments(
     cues = split_text_for_cues(text)
     if not cues:
         return []
-    duration = max(0.001, end - start)
+    duration = max(MIN_SEGMENT_DURATION, end - start)
     weights = [max(1, _visible_length(cue)) for cue in cues]
     total_weight = sum(weights)
     current = start
@@ -104,7 +104,7 @@ def _estimate_segments(
         segments.append(
             TranscriptSegment(
                 start=round(current, 3),
-                end=round(max(segment_end, current + 0.001), 3),
+                end=round(max(segment_end, current + MIN_SEGMENT_DURATION), 3),
                 text=cue,
                 timing_source=timing_source,
             )
@@ -186,7 +186,7 @@ def postprocess_result(
     raw_segments = [
         TranscriptSegment(
             start=max(0.0, float(segment.start)),
-            end=max(float(segment.start) + 0.001, float(segment.end)),
+            end=max(float(segment.start) + MIN_SEGMENT_DURATION, float(segment.end)),
             text=traditional_converter(clean_text(segment.text)),
             timing_source=segment.timing_source,
         )

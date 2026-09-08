@@ -49,6 +49,61 @@ class SchemaAndExportTests(unittest.TestCase):
             loaded = load_package(path, require_completed=True)
             self.assertEqual(loaded["transcript"]["text"], "第一句。\nSecond line.")
 
+    def test_raw_timing_anomaly_round_trips_without_relaxing_canonical_timing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "meeting.transcript.json"
+            payload = completed_package()
+            payload["attempts"][0]["raw_segments"] = [
+                {
+                    "start": 0.5,
+                    "end": 0.5,
+                    "text": "raw zero duration",
+                    "timing_source": "model",
+                },
+                {
+                    "start": 0.2,
+                    "end": 0.1,
+                    "text": "raw backwards range",
+                    "timing_source": "model",
+                },
+            ]
+            write_package(path, payload)
+            loaded = load_package(path, require_completed=True)
+            self.assertEqual(loaded["attempts"][0]["raw_segments"][0]["end"], 0.5)
+            self.assertEqual(loaded["attempts"][0]["raw_segments"][1]["start"], 0.2)
+
+    def test_canonical_timing_rejects_invalid_ranges_order_and_non_finite_values(self) -> None:
+        invalid_segments = (
+            [{"start": 0.0, "end": 0.0, "text": "bad", "timing_source": "model"}],
+            [{"start": -0.1, "end": 0.2, "text": "bad", "timing_source": "model"}],
+            [
+                {"start": 0.8, "end": 1.0, "text": "first", "timing_source": "model"},
+                {"start": 0.6, "end": 0.9, "text": "backwards", "timing_source": "model"},
+            ],
+            [{"start": float("nan"), "end": 1.0, "text": "bad", "timing_source": "model"}],
+        )
+        for segments in invalid_segments:
+            with self.subTest(segments=segments):
+                with tempfile.TemporaryDirectory() as temporary:
+                    payload = completed_package()
+                    payload["transcript"]["segments"] = segments
+                    with self.assertRaises(SchemaError):
+                        write_package(Path(temporary) / "invalid.json", payload)
+
+    def test_raw_non_finite_timing_is_rejected_as_not_json_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            payload = completed_package()
+            payload["attempts"][0]["raw_segments"] = [
+                {
+                    "start": float("nan"),
+                    "end": 1.0,
+                    "text": "bad",
+                    "timing_source": "model",
+                }
+            ]
+            with self.assertRaises(SchemaError):
+                write_package(Path(temporary) / "invalid.json", payload)
+
     def test_failed_package_cannot_export(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "failed.transcript.json"

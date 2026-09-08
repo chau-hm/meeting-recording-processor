@@ -27,7 +27,7 @@ from .progress import ProgressPhase, ProgressReporter, format_duration
 from .quality import inspect_text
 from .runtime import require_apple_silicon, require_media_commands
 from .schema_io import SCHEMA_VERSION, write_package
-from .schemas import AttemptRecord, BackendResult
+from .schemas import AttemptRecord, BackendResult, RawTranscriptSegment
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,6 +252,20 @@ class Extractor:
 
                 runtime_seconds = perf_counter() - started
                 completed_at = utc_now_iso()
+                if backend_result is None:
+                    raw_segments: tuple[RawTranscriptSegment, ...] = ()
+                elif backend_result.raw_segments is not None:
+                    raw_segments = backend_result.raw_segments
+                else:
+                    raw_segments = tuple(
+                        RawTranscriptSegment(
+                            start=segment.start,
+                            end=segment.end,
+                            text=segment.text,
+                            timing_source=segment.timing_source,
+                        )
+                        for segment in backend_result.segments
+                    )
                 attempt = AttemptRecord(
                     attempt_id=attempt_id,
                     backend=backend_name,
@@ -262,7 +276,7 @@ class Extractor:
                     completed_at=completed_at,
                     runtime_seconds=round(runtime_seconds, 3),
                     raw_text=backend_result.text if backend_result else "",
-                    raw_segments=backend_result.segments if backend_result else (),
+                    raw_segments=raw_segments,
                     quality=quality,
                     metadata=backend_result.metadata if backend_result else error_metadata,
                     warnings=backend_result.warnings if backend_result else error_warnings,
@@ -338,17 +352,39 @@ class Extractor:
             write_package(output_path, package, overwrite=config.overwrite)
 
             if status != "completed":
-                failure_detail = pipeline_error or next(
-                    (
-                        attempt.error
-                        for attempt in reversed(attempts)
-                        if attempt.error
-                    ),
-                    "all ASR attempts failed",
+                failure_detail = (
+                    pipeline_error
+                    if pipeline_error and pipeline_error != "all_asr_attempts_failed"
+                    else None
                 )
+                if failure_detail is None:
+                    failure_detail = next(
+                        (
+                            f"{attempt.backend}: {attempt.error}"
+                            for attempt in reversed(attempts)
+                            if attempt.error
+                        ),
+                        None,
+                    )
+                if failure_detail is None:
+                    failure_detail = next(
+                        (
+                            f"{attempt.backend} quality gate: "
+                            f"{', '.join(str(reason) for reason in attempt.quality.get('reasons', ()))}"
+                            for attempt in reversed(attempts)
+                            if attempt.quality.get("reasons")
+                        ),
+                        "all ASR attempts failed",
+                    )
                 progress.fail(failure_detail)
+                human_failure = failure_detail
+                if pipeline_error == "all_asr_attempts_failed":
+                    human_failure = (
+                        "所有可用 ASR attempt 都未能產生有效 transcript；"
+                        f"最後具體原因：{failure_detail}"
+                    )
                 raise TranscriptionFailed(
-                    "所有可用 ASR attempt 都未能產生有效 transcript",
+                    human_failure,
                     diagnostic_path=output_path,
                 )
             progress.complete()
